@@ -661,7 +661,9 @@ def _eliminate_load_store_for_op(
                     if rhs.name == body_var.name:
                         if innermost_loop_vars.initial[i].is_undefined():
                             raise TileSyntaxError(f"Uninitialized variable {name} used")
-            new_operations.append(ops.Assign(rhs, op.result_var, op.loc))
+            func_var = ctx.ir_ctx.make_temp(op.loc)
+            new_operations.append(ops.Const(ct._identity, func_var, op.loc))
+            new_operations.append(ops.Call(func_var, (rhs,), (), op.result_var, op.loc))
         elif name in ctx.globals:
             const_val = get_constant_value(ctx.globals[name])
             new_operations.append(ops.Const(const_val, op.result_var, op.loc))
@@ -669,8 +671,9 @@ def _eliminate_load_store_for_op(
             raise TileSyntaxError(f"Uninitialized variable {name} used")
     elif isinstance(op, ops.Store):
         var = version_map.redefine(op.lhs_var_name, op.loc)
-        assign_op = ops.Assign(op.rhs, var, op.loc)
-        new_operations.append(assign_op)
+        func_var = ctx.ir_ctx.make_temp(op.loc)
+        new_operations.append(ops.Const(ct._identity, func_var, op.loc))
+        new_operations.append(ops.Call(func_var, (op.rhs,), (), var, op.loc))
     elif isinstance(op, ops.Loop):
         # Sort the carried variable names to make the order deterministic.
         carried_var_names = sorted(stored_vars_by_block[op.body])

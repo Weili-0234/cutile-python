@@ -158,28 +158,29 @@ def infer_type(op: Operation, context: TypingContext) -> None:
         context.set_type(result_var, res_type)
 
 
-def _flatten_if_else(block: Block, idx: int, context: TypingContext):
-    from cuda.tile._ir.ops import EndBranch, Assign, Continue, Break
+def _flatten_if_else(block: Block, idx: int):
+    from cuda.tile._ir.ops import EndBranch, assign_untyped, Continue, Break
     op = block[idx]
-    branch_taken = op.then_block if context.constants[op.cond.name] else op.else_block
+    branch_taken = op.then_block if op.cond.get_constant() else op.else_block
     old_ops = branch_taken.detach_all()
-    new_ops = []
-    early_stop = False
-    for inner_op in old_ops:
-        if isinstance(inner_op, EndBranch):
-            for result_var, var in zip(op.result_vars, inner_op.outputs):
-                new_ops.append(Assign(var, result_var, op.loc))
-        else:
-            if isinstance(inner_op, (Continue, Break)):
-                early_stop = True
-            new_ops.append(inner_op)
+    with ir.Builder(block.ctx, op.loc) as ir_builder:
+        early_stop = False
+        for inner_op in old_ops:
+            with ir_builder.change_loc(inner_op.loc):
+                if isinstance(inner_op, EndBranch):
+                    for result_var, var in zip(op.result_vars, inner_op.outputs):
+                        assign_untyped(var, result_var)
+                else:
+                    if isinstance(inner_op, (Continue, Break)):
+                        early_stop = True
+                    ir_builder.append_verbatim(inner_op)
     if early_stop:
         del block[idx+1:]
-    block[idx:idx+1] = new_ops
+    block[idx:idx+1] = ir_builder.ops
 
 
 def _flatten_loop(block: Block, idx: int) -> bool:
-    from cuda.tile._ir.ops import Loop, Break, Assign
+    from cuda.tile._ir.ops import Loop, Break, assign, assign_untyped
 
     loop = block[idx]
     if (not isinstance(loop, Loop)
@@ -188,16 +189,18 @@ def _flatten_loop(block: Block, idx: int) -> bool:
             or _have_break_or_continue(loop.body[:-1])):
         return False
 
-    new_ops = []
-    for init_var, body_var in zip(loop.carried_vars.initial, loop.carried_vars.body, strict=True):
-        new_ops.append(Assign(init_var, body_var, loop.loc))
+    with ir.Builder(block.ctx, loop.loc) as ir_builder:
+        for init_var, body_var in zip(loop.carried_vars.initial, loop.carried_vars.body,
+                                      strict=True):
+            assign(init_var, body_var)
 
-    *body_ops, brek = loop.body.detach_all()
-    new_ops.extend(body_ops)
+        *body_ops, brek = loop.body.detach_all()
+        ir_builder.extend_verbatim(body_ops)
 
-    for break_res, loop_res in zip(brek.output_vars, loop.carried_vars.results, strict=True):
-        new_ops.append(Assign(break_res, loop_res, brek.loc))
-    block[idx:idx+1] = new_ops
+        for break_res, loop_res in zip(brek.output_vars, loop.carried_vars.results, strict=True):
+            assign_untyped(break_res, loop_res)
+
+    block[idx:idx+1] = ir_builder.ops
     return True
 
 
@@ -211,19 +214,14 @@ def _have_break_or_continue(ops):
     )
 
 
-def _add_constant(value, block: Block, loc: Loc, var: Var, ctx: TypingContext, dtype=None):
-    from cuda.tile._ir.ops import const
-    const(value, block, loc, var, dtype=dtype)
-    ctx.set_constant(var, value)
-    ctx.set_type(var, dtype or typeof_pyval(value))
+def _bind_args(sig_func, args, kwargs) -> Sequence[Var]:
+    from cuda.tile._ir.ops import typed_const
 
-
-def _bind_args(sig_func, args, kwargs, block, loc, ctx) -> Sequence[Var]:
     sig = get_signature(sig_func)
     try:
         bound_args = sig.bind(*args, **kwargs)
     except TypeError as e:
-        raise TileTypeError(f"{sig_func.__name__}(): {e}", loc)
+        raise TileTypeError(f"{sig_func.__name__}(): {e}")
     ret = []
     for name, param in sig.parameters.items():
         if name in bound_args.arguments:
@@ -232,9 +230,7 @@ def _bind_args(sig_func, args, kwargs, block, loc, ctx) -> Sequence[Var]:
             ret.append(())
         else:
             assert param.default is not param.empty
-            var = block.make_temp_var(loc)
-            _add_constant(param.default, block, loc, var, ctx)
-            ret.append(var)
+            ret.append(typed_const(param.default))
     return ret
 
 
@@ -245,73 +241,69 @@ def _check_recursive_call(call_loc: Loc, callee: Callable):
         call_loc = call_loc.call_site
 
 
-def _replace_call(block: Block, idx: int, ctx: TypingContext):
-    from cuda.tile._ir.ops import GetBoundSelf, assign, typed_const
+def _replace_call(block: Block, idx: int):
+    from cuda.tile._ir.ops import assign, typed_const, get_bound_self
 
     op = block[idx]
-    new_block = Block(block.ctx)
-    ty = ctx.get_type(op.func)
 
-    args = []
-    if isinstance(ty, FunctionTy):
-        callee = ty.func
-    elif isinstance(ty, BoundMethodTy):
-        callee = ty.func
-        self_var = new_block.make_temp_var(op.loc)
-        new_block.append(GetBoundSelf(op.func, self_var, op.loc))
-        ctx.set_type(self_var, ty.self_ty)
-        args.append(self_var)
-    elif isinstance(ty, DTypeConstructor):
-        callee = ty.dtype
-    else:
-        raise TileTypeError(f"Cannot call an object of type {ty}")
+    remap_result = True
+    with ir.Builder(block.ctx, op.loc) as ir_builder:
+        args = []
+        ty = op.func.get_type()
+        if isinstance(ty, FunctionTy):
+            callee = ty.func
+        elif isinstance(ty, BoundMethodTy):
+            callee = ty.func
+            args.append(get_bound_self(op.func))
+        elif isinstance(ty, DTypeConstructor):
+            callee = ty.dtype
+        else:
+            raise TileTypeError(f"Cannot call an object of type {ty}")
 
-    args.extend(op.args)
-    arg_list = _bind_args(callee, args, op.kwarg_dict(), new_block, op.loc, ctx)
+        args.extend(op.args)
+        arg_list = _bind_args(callee, args, op.kwarg_dict())
 
-    if callee in op_implementations:
-        with ir.Builder(ctx.ir_ctx, op.loc) as ir_builder:
+        if callee in op_implementations:
             result = op_implementations[callee](*arg_list)
             if result is None:
                 result = typed_const(None)
+            assert isinstance(result, Var)
 
-        assert isinstance(result, Var)
-
-        mapper = ir.Mapper(ctx.ir_ctx, preserve_vars=True)
-        mapper.set_var(result, op.result_var)
-        ctx.ir_ctx.copy_type_information(result, op.result_var)
-
-        for new_op in ir_builder.ops:
-            new_block.append(new_op.clone(mapper))
-
-        # If the returned result variable is not produced by any of the newly created operations,
-        # insert an Assign op.
-        #
-        # This mainly happens when an operation implementation reduces to a no-op by returning
-        # its input. For example, reshape(x, new_shape) may return x when the new shape is the same
-        # as the old one. So we need to replace `y = reshape(x, new_shape)` with `y = assign(x)`
-        # to make sure `y` is still defined.
-        if not any(result.name == r.name
+            if all(result.name != r.name
                    for new_op in ir_builder.ops for r in new_op.result_vars):
-            assign(result, new_block, op.loc, op.result_var)
-    else:
-        # Callee is a user-defined function.
-        from cuda.tile._ast2ir import get_function_ir
-        _check_recursive_call(op.loc, callee)
+                # If the returned result variable is not produced by any of
+                # the newly created operations, insert an Assign op.
+                #
+                # This mainly happens when an operation implementation reduces to a no-op
+                # by returning its input. For example, reshape(x, new_shape) may return `x`
+                # when the new shape is the same as the old one. So we need to replace
+                # `y = reshape(x, new_shape)` with `y = assign(x)` to make sure `y` is defined.
+                assign(result, op.result_var)
+                remap_result = False
+        else:
+            # Callee is a user-defined function.
+            from cuda.tile._ast2ir import get_function_ir
+            _check_recursive_call(op.loc, callee)
 
-        sig = get_signature(callee)
-        for param_name, param in sig.parameters.items():
-            if param.kind in (inspect.Parameter.VAR_POSITIONAL,
-                              inspect.Parameter.VAR_KEYWORD):
-                raise TileSyntaxError("Variadic parameters in user-defined"
-                                      " functions are not supported")
-        callee_function_ir = get_function_ir(callee, new_block.ctx, call_site=op.loc)
-        for arg, param in zip(arg_list, callee_function_ir.parameters):
-            assign(arg, new_block, op.loc, param)
-        new_block.extend(callee_function_ir.root_block.detach_all())
-        assign(callee_function_ir.return_value, new_block, op.loc, op.result_var)
+            sig = get_signature(callee)
+            for param_name, param in sig.parameters.items():
+                if param.kind in (inspect.Parameter.VAR_POSITIONAL,
+                                  inspect.Parameter.VAR_KEYWORD):
+                    raise TileSyntaxError("Variadic parameters in user-defined"
+                                          " functions are not supported")
+            callee_function_ir = get_function_ir(callee, block.ctx, call_site=op.loc)
+            for arg, param in zip(arg_list, callee_function_ir.parameters):
+                assign(arg, param)
+            ir_builder.extend_verbatim(callee_function_ir.root_block.detach_all())
+            result = callee_function_ir.return_value
 
-    block[idx:idx+1] = new_block.detach_all()
+    new_ops = ir_builder.ops
+    if remap_result:
+        mapper = ir.Mapper(block.ctx, preserve_vars=True)
+        mapper.set_var(result, op.result_var)
+        block.ctx.copy_type_information(result, op.result_var)
+        new_ops = [new_op.clone(mapper) for new_op in new_ops]
+    block[idx:idx+1] = new_ops
 
 
 def infer_types_for_op(context: TypingContext, block: Block, i: int) -> int:
@@ -322,12 +314,12 @@ def infer_types_for_op(context: TypingContext, block: Block, i: int) -> int:
     if _flatten_loop(block, i):
         return 0
 
-    if isinstance(op, IfElse) and op.cond.name in context.constants:
-        _flatten_if_else(block, i, context)
+    if isinstance(op, IfElse) and op.cond.is_constant():
+        _flatten_if_else(block, i)
         return 0
 
     if isinstance(op, Call):
-        _replace_call(block, i, context)
+        _replace_call(block, i)
         return 0
 
     if isinstance(op, Const):

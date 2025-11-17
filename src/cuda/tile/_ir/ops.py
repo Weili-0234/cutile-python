@@ -20,7 +20,7 @@ from cuda.tile._exception import (
 )
 from cuda.tile._ir.ir import (
     AstOperation, Operation, Var, Loc, Block, TypeResult,
-    has_side_effects, terminator, Mapper, add_operation, TypedOperation, RangeInfo
+    has_side_effects, terminator, Mapper, add_operation, TypedOperation, RangeInfo, Builder
 )
 from cuda.tile._ir.load_store_impl import (
     check_load_store_hints,
@@ -284,7 +284,7 @@ class Loop(Operation):
         return f"{header_str} (with {carried_vars_str})"
 
 
-@dataclass
+@dataclass(eq=False)
 class IfElseResults:
     names: Sequence[str]
     vars: Sequence[Var] = ()
@@ -547,7 +547,7 @@ def _check_value_numeric_type(value: Any, dtype: DType) -> None:
 class Const(Operation):
     def __init__(
         self,
-        value: Union[int, float, bool, str, tuple, DType, None, types.EllipsisType],
+        value: Any,
         result_var: Var,
         loc: Loc,
         dtype: Optional[DType] = None,
@@ -1554,7 +1554,7 @@ def bind_method(object: Var, func) -> Var:
     return add_operation(BindMethod, res_ty, object=object, func=func)
 
 
-class GetBoundSelf(Operation):
+class GetBoundSelf(TypedOperation):
     def __init__(self, bound_method: Var, result_var: Var, loc: Loc):
         super().__init__("get_bound_self", operands={"bound_method": bound_method},
                          result_vars=[result_var], loc=loc)
@@ -1568,34 +1568,43 @@ class GetBoundSelf(Operation):
         return [ctx.get_value_tuple(self.bound_method)]
 
 
-class Assign(Operation):
+def get_bound_self(bound_method: Var) -> Var:
+    return add_operation(GetBoundSelf, bound_method.get_type().self_ty, bound_method=bound_method)
+
+
+class Assign(TypedOperation):
     def __init__(self, value: Var, result_var: Var, loc: Loc):
         super().__init__(
             "assign", operands={"value": value}, result_vars=[result_var], loc=loc
         )
 
     @override
-    def infer_type(self, ctx: TypingContext) -> TypeResult:
-        if self.value.name in ctx.range_infos:
-            ctx.range_infos[self.result_var.name] = ctx.range_infos[self.value.name]
-        return ctx.get_type(self.value)
-
-    @override
     def generate_bytecode(self, ctx: BytecodeContext) -> list[tuple[bc.Value, ...]]:
         return [ctx.get_value_tuple(self.value)]
-
-    @override
-    def fold_constant(self, typing_context: TypingContext) -> Any:
-        return typing_context.get_constant(self.value)
 
     @override
     def _to_string_rhs(self) -> str:
         return f"{self.value.name}"
 
 
-def assign(value: Var, block: Block, loc: Loc, res: Var) -> None:
-    assign_op = Assign(value, res, loc)
-    block.append(assign_op)
+def assign(value: Var, res: Var) -> None:
+    Builder.get_current().append_verbatim(Assign(value, res, res.loc))
+    res.ctx.copy_type_information(value, res)
+    if value.is_undefined():
+        res.set_undefined()
+
+
+def assign_untyped(value: Var, res: Var):
+    identity_var = add_operation(Const, None, value=ct._identity)
+    Builder.get_current().append_verbatim(Call(identity_var, (value,), (), res, res.loc))
+
+
+@impl(ct._identity)
+def identity_impl(x: Var) -> Var:
+    if x.is_constant():
+        return typed_const(x.get_constant(), x.get_type())
+    else:
+        return x
 
 
 class Range(TypedOperation):

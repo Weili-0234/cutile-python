@@ -9,6 +9,7 @@ import threading
 from collections import OrderedDict
 from collections import defaultdict
 from collections.abc import Mapping
+from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -18,7 +19,7 @@ from typing import (
 
 from typing_extensions import override
 
-from .type import Type
+from .type import Type, UNDEFINED
 from .typing_support import typeof_pyval, get_constant_value
 from cuda.tile._exception import (
     TileTypeError,
@@ -85,6 +86,8 @@ class Var:
         try:
             return self.ctx.typemap[self.name]
         except KeyError:
+            if self._undefined:
+                return UNDEFINED
             raise TileInternalError(f"Type of variable {self.name} not found")
 
     def set_type(self, ty: Type):
@@ -201,11 +204,26 @@ class Builder:
     def ops(self) -> Sequence[Operation]:
         return self._ops
 
+    def append_verbatim(self, op: Operation):
+        self._ops.append(op)
+
+    def extend_verbatim(self, ops: Sequence[Operation]):
+        self._ops.extend(ops)
+
     @staticmethod
     def get_current() -> "Builder":
         ret = _current_builder.builder
         assert ret is not None, "No IR builder is currently active"
         return ret
+
+    @contextmanager
+    def change_loc(self, loc: Loc):
+        old_loc = self._loc
+        self._loc = loc
+        try:
+            yield
+        finally:
+            self._loc = old_loc
 
     def __enter__(self):
         assert not self._entered
