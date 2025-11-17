@@ -1261,35 +1261,25 @@ def len_impl(x: Var) -> Var:
     return add_operation(ListLen, datatype.int32, x=x)
 
 
-class BuildTuple(Operation):
-    def __init__(self, items: tuple[Var], result_var: Var, loc: Loc):
+class BuildTuple(TypedOperation):
+    def __init__(self, items: tuple[Var, ...], result_var: Var, loc: Loc):
         super().__init__("build_tuple",
                          operands={"items": items},
                          result_vars=[result_var],
                          loc=loc)
 
     @override
-    def infer_type(self, typing_context: TypingContext) -> TypeResult:
-        return TupleTy(
-            tuple(typing_context.get_type(item) for item in self.items)
-        )
-
-    @override
     def generate_bytecode(self, ctx: BytecodeContext):
         return [sum((ctx.get_value_tuple(x) for x in self.items), ())]
 
-    @override
-    def fold_constant(self, typing_context: TypingContext) -> Tuple[Any, ...]:
-        folded_tuple = []
-        for item in self.items:
-            constant_val = typing_context.get_constant(item)
-            folded_tuple.append(constant_val)
-        return tuple(folded_tuple)
 
+@impl(ct._build_tuple)
+def build_tuple(items: tuple[Var, ...]) -> Var:
+    if all(x.is_constant() for x in items):
+        return typed_const(tuple(x.get_constant() for x in items))
 
-def build_tuple(items: tuple[Var], block: Block, loc: Loc, res: Var) -> None:
-    build_tuple_op = BuildTuple(items, res, loc)
-    block.append(build_tuple_op)
+    ty = TupleTy(tuple(x.get_type() for x in items))
+    return add_operation(BuildTuple, ty, items=items)
 
 
 class Unary(TypedOperation):

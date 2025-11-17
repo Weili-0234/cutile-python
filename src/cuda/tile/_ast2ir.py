@@ -264,8 +264,13 @@ def _constant_expr(node: ast.Constant, block: ir.Block, ctx: Any) -> ir.Var:
 @_register(_expr_handlers, ast.Tuple)
 def _tuple_expr(tup: ast.Tuple, block: ir.Block, ctx: _Context) -> ir.Var:
     items = tuple(_expr(x, block, ctx) for x in tup.elts)
-    res = block.make_temp_var(ctx.get_loc(tup))
-    ops.build_tuple(items, block, ctx.get_loc(tup), res)
+    loc = ctx.get_loc(tup)
+
+    func_var = block.make_temp_var(loc)
+    ops.const(ct._build_tuple, block, loc, func_var)
+
+    res = block.make_temp_var(loc)
+    ops.call(func_var, items, (), block, loc, res)
     return res
 
 
