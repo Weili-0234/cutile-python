@@ -85,6 +85,17 @@ Within |tile code|, there is no Python runtime.
 Only Python features explicitly enumerated in this document are supported.
 Many features, such as lambdas, exceptions, and coroutines are not supported today.
 
+Current limitations
+~~~~~~~~~~~~~~~~~~~
+
+The Python subset used in |tile code| imposes additional restrictions on control flow:
+
+* ``step`` must be strictly positive.
+
+  Negative-step ranges such as
+  ``range(10, 0, -1)`` are not supported today. Passing a negative step
+  indirectly via a variable may lead to undefined behavior.
+
 Object Model & Lifetimes
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
