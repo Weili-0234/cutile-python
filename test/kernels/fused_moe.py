@@ -4,11 +4,11 @@
 
 import cuda.tile as ct
 import torch
-import torch.nn.functional as F
 
 from kernels.matmul import swizzle_2d
 
 ConstInt = ct.Constant[int]
+ConstBool = ct.Constant[bool]
 
 
 @ct.kernel
@@ -20,7 +20,7 @@ def fused_moe_kernel(
     sorted_token_ids,
     sorted_expert_ids,
     num_token_replicas: int,
-    mul_routed_weight: bool,
+    mul_routed_weight: ConstBool,
     TILE_M: ConstInt,
     TILE_N: ConstInt,
     TILE_K: ConstInt,
@@ -82,12 +82,33 @@ def fused_moe_kernel(
     ct.scatter(C, (token_ids[:, None], c_col_indices[None, :]), accumulator)
 
 
+@ct.kernel
+def silu_and_mul_kernel(A, B, C, TILE_N: ConstInt):
+    """
+    Element-wise kernel that computes SiLU(A) * B.
+
+    Args:
+        A: Input tensor A.
+        B: Input tensor B.
+        C: Output tensor.
+    """
+
+    bid_m = ct.bid(0)
+    ta = ct.load(A, (bid_m, 0), (1, TILE_N)).astype(ct.float32)
+    tb = ct.load(B, (bid_m, 0), (1, TILE_N)).astype(ct.float32)
+
+    # Sigmoid(ta)
+    denom = ct.add(1, ct.exp(-ta), flush_to_zero=True)
+    sigmoid_ta = ct.truediv(1.0, denom, flush_to_zero=True, rounding_mode=ct.RoundingMode.APPROX)
+
+    # SiLU(ta) * tb
+    silu_ta = ct.mul(ta, sigmoid_ta, flush_to_zero=True)
+    tc = ct.mul(silu_ta, tb, flush_to_zero=True)
+
+    ct.store(C, (bid_m, 0), tc.astype(C.dtype))
+
+
 # -- PyTorch Utilities --
-
-def silu_and_mul_torch(input: torch.Tensor, out: torch.Tensor):
-    gate_result, up_result = input.chunk(2, dim=-1)
-    torch.mul(F.silu(gate_result), up_result, out=out)
-
 
 def moe_align_tile_size_torch(
     topk_ids: torch.Tensor, tile_m: int, num_experts: int

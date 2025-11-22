@@ -8,24 +8,11 @@ import pytest
 import torch
 import cuda.tile as ct
 from math import ceil
-from util import estimate_bench_iter
+from util import estimate_bench_iter, next_power_of_2
 from kernels.rms_norm import (
     rms_norm_kernel, rms_norm_kernel_gather, rms_norm_kernel_static_persistent
 )
 from autotuner.autotuner import Autotuner, Config, SearchSpace, autotune
-
-
-def next_power_of_2(n: int):
-    """Return the smallest power of 2 greater than or equal to n"""
-    n -= 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    n |= n >> 32
-    n += 1
-    return n
 
 
 @pytest.fixture(params=[

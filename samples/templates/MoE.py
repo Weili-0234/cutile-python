@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 import cuda.tile as ct
 
-from test.kernels.fused_moe import fused_moe_kernel, moe_align_tile_size_torch, silu_and_mul_torch
+from test.kernels.fused_moe import fused_moe_kernel, moe_align_tile_size_torch, silu_and_mul_kernel
 
 
 # --- cuTile MoE Wrapper ------------------------------------------------------
@@ -85,7 +85,7 @@ def cutile_moe(
         tile_k=tile_k,
     )
 
-    silu_and_mul_torch(
+    invoke_silu_and_mul_kernel(
         intermediate_cache1.view(-1, intermediate_cache1.shape[-1]),
         intermediate_cache2,
     )
@@ -192,6 +192,37 @@ def invoke_fused_moe_kernel(
             tile_k,
         ),
     )
+
+
+def invoke_silu_and_mul_kernel(
+    AB: torch.Tensor,
+    C: torch.Tensor
+):
+    A, B = AB.chunk(2, dim=-1)
+    ct.launch(
+        torch.cuda.current_stream(),
+        (AB.shape[0],),
+        silu_and_mul_kernel,
+        (
+            A,
+            B,
+            C,
+            next_power_of_2(C.shape[-1])
+        )
+    )
+
+
+def next_power_of_2(n: int):
+    """Return the smallest power of 2 greater than or equal to n"""
+    n -= 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    n += 1
+    return n
 
 
 if __name__ == "__main__":

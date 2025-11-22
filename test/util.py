@@ -196,3 +196,16 @@ def get_int_dtype_of_same_size(t: torch.dtype) -> torch.dtype:
         case torch.int16: return torch.int16
         case torch.int8: return torch.int8
         case _: raise NotImplementedError()
+
+
+def next_power_of_2(n: int):
+    """Return the smallest power of 2 greater than or equal to n"""
+    n -= 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    n += 1
+    return n
