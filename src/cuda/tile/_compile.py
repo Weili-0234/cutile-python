@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: Apache-2.0
-
+import math
+import re
 from dataclasses import dataclass
 import datetime
 import functools
@@ -241,7 +242,6 @@ def _local_deps_dir():
 @cache
 def _find_compiler_bin() -> tuple[str, str, str]:
     # search under cuda/tile/_deps
-    res = None
     bin_path = os.environ.get('PATH', '')
     ld_path = os.environ.get('LD_LIBRARY_PATH', "") if not is_windows() else ""
 
@@ -267,9 +267,49 @@ def _find_compiler_bin() -> tuple[str, str, str]:
             bin_path = bin_path + ":" + cuda_bin_path
             return res, bin_path, ld_path
 
+    # Try default CUDA Toolkit installation paths as a fallback
+    res = _find_compiler_in_default_cuda_toolkit_paths()
+    if res is not None:
+        tileiras_path, bin_path = res
+        return tileiras_path, bin_path, ld_path
+
     cuda_home_var = "CUDA_PATH" if is_windows() else "CUDA_HOME"
     raise FileNotFoundError(f"'tileiras' compiler not found, "
                             f"make sure it is available in $PATH or ${cuda_home_var}/bin")
+
+
+def _find_compiler_in_default_cuda_toolkit_paths() -> tuple[str, str] | None:
+    binary_name = "tileiras.exe" if is_windows() else "tileiras"
+    for toolkit_path in _get_default_cuda_toolkit_paths():
+        bin_path = os.path.join(toolkit_path, "bin")
+        p = os.path.join(bin_path, binary_name)
+        if os.path.exists(p) and os.access(p, os.X_OK) and not os.path.isdir(p):
+            return p, bin_path
+    return None
+
+
+def _get_default_cuda_toolkit_paths() -> list[str]:
+    candidates = []
+
+    if os.name == "nt":
+        prefix = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA"
+        regex = re.compile(r"[vV]([0-9]+)(\.[0-9]+)?")
+    else:
+        prefix = "/usr/local"
+        regex = re.compile(r"cuda-([0-9]+)(\.[0-9]+)?")
+        candidates.append((math.inf, math.inf, "cuda"))
+
+    for subdir in os.listdir(prefix):
+        m = re.fullmatch(regex, subdir)
+        if m is None:
+            continue
+        major = int(m.group(1))
+        minor = m.group(2)
+        minor = math.inf if minor is None else int(minor[1:])
+        candidates.append((major, minor, subdir))
+
+    return [os.path.join(prefix, subdir)
+            for _, _, subdir in reversed(sorted(candidates))]
 
 
 def _try_get_compiler_version(compiler_bin) -> Optional[str]:
