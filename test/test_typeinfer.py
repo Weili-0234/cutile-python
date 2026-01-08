@@ -391,3 +391,15 @@ def test_typeof_constant_too_big():
     x = torch.zeros((), dtype=torch.uint64, device="cuda")
     with pytest.raises(TileValueError, match="is out of range of any supported integer type"):
         ct.launch(torch.cuda.current_stream(), (1,), kernel, (x,))
+
+
+def test_allow_type_hints_on_assignment():
+    @ct.kernel
+    def kernel(x):
+        a: int = ct.gather(x, ())  # the hint is intentionally wrong -- should still work
+        a: float
+        ct.scatter(x, (), a + 3.0)
+
+    x = torch.ones((), dtype=torch.float32, device="cuda")
+    ct.launch(torch.cuda.current_stream(), (1,), kernel, (x,))
+    assert x.item() == 4.0

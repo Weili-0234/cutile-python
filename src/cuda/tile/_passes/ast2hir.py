@@ -323,18 +323,29 @@ _stmt_handlers: Dict[Type[ast.AST], Callable] = {}
 def _assign_stmt(assign: ast.Assign, ctx: _Context) -> None:
     value = _expr(assign.value, ctx)
     for target in reversed(assign.targets):
-        with ctx.change_loc(target):
-            if isinstance(target, ast.Name):
-                ctx.store(target.id, value)
-            elif isinstance(target, ast.Tuple):
-                for i, el in enumerate(target.elts):
-                    with ctx.change_loc(el):
-                        if not isinstance(el, ast.Name):
-                            raise ctx.unsupported_syntax()
-                        item_var = ctx.call(operator.getitem, (value, i), )
-                        ctx.store(el.id, item_var)
-            else:
-                raise ctx.unsupported_syntax()
+        _do_assign(value, target, ctx)
+
+
+@_register(_stmt_handlers, ast.AnnAssign)
+def _ann_assign_stmt(ann_assign: ast.AnnAssign, ctx: _Context) -> None:
+    if ann_assign.value is not None:
+        value = _expr(ann_assign.value, ctx)
+        _do_assign(value, ann_assign.target, ctx)
+
+
+def _do_assign(value: hir.Operand, target, ctx: _Context):
+    with ctx.change_loc(target):
+        if isinstance(target, ast.Name):
+            ctx.store(target.id, value)
+        elif isinstance(target, ast.Tuple):
+            for i, el in enumerate(target.elts):
+                with ctx.change_loc(el):
+                    if not isinstance(el, ast.Name):
+                        raise ctx.unsupported_syntax()
+                    item_var = ctx.call(operator.getitem, (value, i), )
+                    ctx.store(el.id, item_var)
+        else:
+            raise ctx.unsupported_syntax()
 
 
 @_register(_stmt_handlers, ast.AugAssign)
