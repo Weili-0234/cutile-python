@@ -13,7 +13,7 @@ from cuda.tile._memory_model import MemoryOrder
 from cuda.tile._exception import Loc, TileInternalError
 from cuda.tile._ir.ir import Block, IRContext, Var, Operation
 from cuda.tile._ir.ops import (
-    Assign, Break, Continue, EndBranch, IfElse,
+    Break, Continue, EndBranch, IfElse,
     JoinTokens, LoadMemoryOperation, Loop, MakeToken,
     MemoryOperation, StoreMemoryOperation, TileAtomicCAS, TileAtomicCASTokenOrdered,
     TileAtomicRMW, TileAtomicRMWTokenOrdered, LoadPointer, LoadPointerTokenOrdered,
@@ -106,7 +106,6 @@ class VarInfo:
 @dataclass(frozen=True)
 class TokenOrderContext:
     alias_result: AliasResult
-    var_info: VarInfo
     block_memory_effects: Dict[Block, MemoryEffects]
 
 
@@ -123,8 +122,7 @@ _TOKEN_ORDERED_OP_MAP = {
 def token_order_pass(root_block: Block, alias_result: AliasResult):
     block_memory_effects = {}
     _get_block_memory_effects(root_block, alias_result, block_memory_effects)
-    var_info = _get_var_info(root_block)
-    context = TokenOrderContext(alias_result, var_info, block_memory_effects)
+    context = TokenOrderContext(alias_result, block_memory_effects)
 
     root_tok = _make_token_var(root_block.ctx, root_block.loc)
     token_map = defaultdict(lambda: root_tok)
@@ -167,21 +165,6 @@ def _get_block_memory_effects(block: Block,
             blk_mem_effects = blk_mem_effects | block_memory_effects[nested_block]
 
     block_memory_effects[block] = blk_mem_effects
-
-
-# TODO: Assign ops should be gone at this point. Need to verify this and remove this logic.
-def _get_var_info(root_block: Block) -> VarInfo:
-    root_var = dict()
-
-    def traverse(block: Block):
-        for op in block.operations:
-            if isinstance(op, Assign):
-                root_var[op.result_var.name] = root_var.get(op.value.name, op.value.name)
-            for block in op.nested_blocks:
-                traverse(block)
-
-    traverse(root_block)
-    return VarInfo(root_var)
 
 
 def _to_token_order_in_block(block: Block,
@@ -523,7 +506,7 @@ def _get_parallel_stores(
         tile_store_candidates.add(mem_ops[0])
 
     # Filter in stores that have non-overlapping indices
-    res = _filter_by_store_index(loop_op, tile_store_candidates, context.var_info)
+    res = _filter_by_store_index(loop_op, tile_store_candidates)
     return res
 
 
@@ -539,13 +522,11 @@ def _get_nested_mem_effects(
 
 
 def _filter_by_store_index(loop_op: Loop,
-                           tile_store_candidates: Set[Operation],
-                           var_info: VarInfo) -> Set[Operation]:
+                           tile_store_candidates: Set[Operation]) -> Set[Operation]:
 
     def is_idx_injective(idx_var: Var) -> bool:
-        root_idx_var = var_info.root_var.get(idx_var.name, idx_var.name)
         # TODO: allow more complex injective check: j = i * 2 + 3
-        return loop_op.is_for_loop and root_idx_var == loop_op.induction_var.name
+        return loop_op.is_for_loop and idx_var.name == loop_op.induction_var.name
 
     return set(store_op for store_op in tile_store_candidates
                if _get_input_var(store_op).get_type().elements_disjoint
