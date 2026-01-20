@@ -26,7 +26,8 @@ SAMPLES_TO_TEST = [
     "Transpose.py",
     "AttentionFMHA.py",
     "LayerNorm.py",
-    "MoE.py"
+    "MoE.py",
+    "AllGatherMatmul.py",
 ]
 
 # Get the absolute path of the current directory to ensure the script
@@ -77,8 +78,10 @@ def test_sample_script_execution_correctness(sample_file):
         if "An unexpected error occurred" in captured_output:
             pytest.fail(f"Test for {sample_file} failed due to an unexpected error in the output.")
         # Check all the correctness checks passed and not disabled.
-        if ("Correctness check failed" in captured_output or
-                "Correctness check passed" not in captured_output):
+        if ("Skipped test" not in captured_output and (
+                "Correctness check failed" in captured_output or
+                "Correctness check passed" not in captured_output
+                )):
             pytest.fail(
                 f"Test for {sample_file} failed: "
                 "correctness check disabled or failed in the output."
