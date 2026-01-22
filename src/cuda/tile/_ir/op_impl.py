@@ -366,13 +366,6 @@ def require_list_type(var: Var) -> ListTy:
     return ty
 
 
-def require_integer_dtype(var: Var) -> DType:
-    ty = var.get_type()
-    if not isinstance(ty, DType) or not is_integral(ty):
-        raise TileTypeError(f"Expected an integer scalar, but given value has type {ty}")
-    return ty
-
-
 def require_tuple_type(var: Var) -> TupleTy:
     ty = var.get_type()
     if not isinstance(ty, TupleTy):

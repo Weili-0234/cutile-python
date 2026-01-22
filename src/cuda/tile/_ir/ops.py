@@ -35,7 +35,7 @@ from .op_impl import (
     require_tile_type, normalize_axis, require_dtype_spec,
     require_tile_or_scalar_type, require_constant_bool, require_optional_constant_enum,
     require_constant_str, require_array_type, require_tuple_type, require_constant_slice,
-    require_list_type, require_integer_dtype, require_scalar_or_0d_tile_type,
+    require_list_type, require_scalar_or_0d_tile_type,
     require_index_or_index_tuple_type, require_constant_shape, require_constant_axis_order,
     require_constant_enum, require_optional_constant_int, require_optional_constant_bool,
     require_optional_constant_str, PrintfValidator, require_tile_or_scalar_maybe_loose_type,
@@ -1285,7 +1285,10 @@ class GetArrayListItem(TypedOperation):
 
 def list_item(x: Var, index: Var) -> Var:
     list_ty = require_list_type(x)
-    require_integer_dtype(index)
+    index_ty = require_scalar_or_0d_tile_type(index)
+    index_dtype = get_dtype(index_ty)
+    if not (isinstance(index_dtype, DType) and is_integral(index_dtype)):
+        raise TypeError(f"Index must be an integer scalar or 0D Tile, got {index_ty}")
     item_ty = list_ty.item_type
 
     if not isinstance(item_ty, ArrayTy):

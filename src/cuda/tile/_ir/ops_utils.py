@@ -185,7 +185,8 @@ def memory_order_has_release(memory_order: MemoryOrder):
     return memory_order in (MemoryOrder.RELEASE, MemoryOrder.ACQ_REL)
 
 
-def get_dtype(ty: TileTy | datatype.DType | LooselyTypedScalar) -> datatype.DType | PointerTy:
+def get_dtype(ty: TileTy | datatype.DType | PointerTy | LooselyTypedScalar) \
+        -> datatype.DType | PointerTy:
     if isinstance(ty, TileTy):
         return ty.dtype
     elif isinstance(ty, datatype.DType):
