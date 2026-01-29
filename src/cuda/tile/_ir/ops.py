@@ -124,7 +124,7 @@ class Loop(TypedOperation):
         if self.is_for_loop:
             start, stop, step = (ctx.get_value(x) for x in (self.start, self.stop, self.step))
             nested_builder = bc.encode_ForOp(ctx.builder, result_type_ids, start, stop, step,
-                                             initial_values)
+                                             initial_values, unsignedCmp=False)
             induction_var_type_id = ctx.typeid_of(self.induction_var)
             block_arg_type_ids = (induction_var_type_id, *result_type_ids)
         else:
@@ -1359,7 +1359,8 @@ class Unary(TypedOperation):
             case "abs", True: return bc.encode_AbsFOp(ctx.builder, res_type_id, x)
             case "abs", False: return bc.encode_AbsIOp(ctx.builder, res_type_id, x)
             case "neg", True: return bc.encode_NegFOp(ctx.builder, res_type_id, x)
-            case "neg", False: return bc.encode_NegIOp(ctx.builder, res_type_id, x)
+            case "neg", False: return bc.encode_NegIOp(ctx.builder, res_type_id, x,
+                                                       bc.IntegerOverflow.NONE)
             case "exp", True: return bc.encode_ExpOp(ctx.builder, res_type_id, x)
             case "exp2", True: return bc.encode_Exp2Op(ctx.builder, res_type_id, x,
                                                        flush_to_zero=flush_to_zero)
@@ -1368,7 +1369,9 @@ class Unary(TypedOperation):
             case "sinh", True: return bc.encode_SinHOp(ctx.builder, res_type_id, x)
             case "cosh", True: return bc.encode_CosHOp(ctx.builder, res_type_id, x)
             case "tan", True: return bc.encode_TanOp(ctx.builder, res_type_id, x)
-            case "tanh", True: return bc.encode_TanHOp(ctx.builder, res_type_id, x)
+            # TODO: rounding mode support depending on bytecode version
+            case "tanh", True: return bc.encode_TanHOp(ctx.builder, res_type_id, x,
+                                                       rounding_mode=bc.RoundingMode.FULL)
             case "log", True: return bc.encode_LogOp(ctx.builder, res_type_id, x)
             case "log2", True: return bc.encode_Log2Op(ctx.builder, res_type_id, x)
             case "sqrt", True: return bc.encode_SqrtOp(ctx.builder, res_type_id, x,
@@ -3473,7 +3476,9 @@ class TilePrintf(TypedOperation):
     def generate_bytecode(self, ctx: BytecodeContext):
         arg_vars = [ctx.get_value(arg) for arg in self.args]
         with tile_mutex("print_mutex", ctx):
-            bc.encode_PrintOp(ctx.builder, arg_vars, self.format)
+            result_typeid = (ctx.type_table.Token
+                             if ctx.builder.version >= bc.BytecodeVersion.V_13_2 else None)
+            bc.encode_PrintTkoOp(ctx.builder, result_typeid, arg_vars, None, self.format)
         return []
 
 

@@ -12,5 +12,6 @@ from .debug_info import DebugAttrId, DebugAttrTable, MISSING_DEBUG_ATTR_ID  # no
 from .code_builder import CodeBuilder, Value  # noqa: F401
 from .float import float_to_bits, float_bit_size  # noqa: F401
 from .encodings import *  # noqa: F401 F403
+from .version import BytecodeVersion  # noqa: F401
 
 DYNAMIC_SHAPE = -1 << 63   # INT64_MIN

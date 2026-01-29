@@ -15,7 +15,7 @@ import cuda.tile as ct
 
 def test_write_simple_module():
     buf = bytearray()
-    with bc.write_bytecode(1, buf) as writer:
+    with bc.write_bytecode(1, buf, version=bc.BytecodeVersion.V_13_1) as writer:
         tt = writer.type_table
         with writer.function(name="foo",
                              parameter_types=[tt.tile(tt.pointer(tt.F32), ()),

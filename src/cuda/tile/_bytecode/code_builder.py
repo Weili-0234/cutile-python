@@ -11,6 +11,7 @@ from .basic import encode_varint, encode_int_list, StringTable
 from .constant import ConstantTable
 from .debug_info import DebugAttrId
 from .type import TypeId, encode_typeid
+from .version import BytecodeVersion
 
 
 @dataclass
@@ -57,6 +58,7 @@ class NestedBlockBuilder:
 @dataclass
 class CodeBuilder:
     buf: bytearray
+    version: BytecodeVersion
     string_table: StringTable
     constant_table: ConstantTable
     debug_attr_per_op: List[DebugAttrId]

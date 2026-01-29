@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) <2026> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: Apache-2.0
 
@@ -12,6 +12,7 @@ from .code_builder import (
     encode_unsized_variadic_operands, encode_sized_variadic_operands, encode_operand
 )
 from .type import encode_typeid, encode_sized_typeid_seq, TypeId
+from .version import BytecodeVersion
 
 
 class AtomicRMWMode(enum.Enum):
@@ -197,6 +198,23 @@ def encode_AssumeOp(
     code_builder.encode_opattr_tagged(AssumePredicate, predicate)
     # Operands
     encode_operand(value, _buf)
+    return code_builder.new_op()
+
+
+def encode_Atan2Op(  # since 13.2
+    code_builder: CodeBuilder,
+    result_type: TypeId,  # since 13.2
+    x: Value,  # since 13.2
+    y: Value,  # since 13.2
+) -> Value:
+    _buf = code_builder.buf
+    # Opcode
+    encode_varint(110, _buf)
+    # Result types
+    encode_typeid(result_type, _buf)
+    # Operands
+    encode_operand(x, _buf)
+    encode_operand(y, _buf)
     return code_builder.new_op()
 
 
@@ -676,12 +694,18 @@ def encode_ForOp(
     upperBound: Value,
     step: Value,
     initValues: Sequence[Value],
+    unsignedCmp: bool,  # since 13.2
 ) -> NestedBlockBuilder:
     _buf = code_builder.buf
     # Opcode
     encode_varint(41, _buf)
     # Variadic result types
     encode_sized_typeid_seq(result_types, _buf)
+    # Flags
+    _flag_bits = bool(unsignedCmp)
+    assert _flag_bits < 1 or code_builder.version >= BytecodeVersion.V_13_2
+    if code_builder.version >= BytecodeVersion.V_13_2:
+        encode_varint(_flag_bits, _buf)
     # Operands
     encode_varint(3 + len(initValues), _buf)
     encode_operand(lowerBound, _buf)
@@ -1243,12 +1267,18 @@ def encode_NegIOp(
     code_builder: CodeBuilder,
     result_type: TypeId,
     source: Value,
+    overflow: IntegerOverflow,  # since 13.2
 ) -> Value:
     _buf = code_builder.buf
     # Opcode
     encode_varint(80, _buf)
     # Result types
     encode_typeid(result_type, _buf)
+    # Attributes
+    if code_builder.version >= BytecodeVersion.V_13_2:
+        code_builder.encode_opattr_enum(IntegerOverflow, overflow)
+    else:
+        assert overflow == IntegerOverflow.NONE
     # Operands
     encode_operand(source, _buf)
     return code_builder.new_op()
@@ -1323,22 +1353,37 @@ def encode_PowOp(
     return code_builder.new_op()
 
 
-def encode_PrintOp(
+def encode_PrintTkoOp(
     code_builder: CodeBuilder,
+    result_token_type: Optional[TypeId],  # since 13.2
     args: Sequence[Value],
+    token: Optional[Value],  # since 13.2
     str: str,
-) -> None:
+) -> Optional[Value]:
     _buf = code_builder.buf
     # Opcode
     encode_varint(85, _buf)
     # Variadic result types
-    encode_sized_typeid_seq((), _buf)
+    result_types = []
+    if code_builder.version >= BytecodeVersion.V_13_2:
+        result_token_idx = len(result_types)
+        result_types.append(result_token_type)
+    else:
+        assert result_token_type is None
+        result_token_idx = None
+    encode_sized_typeid_seq(result_types, _buf)
+    # Flags
+    _flag_bits = (token is not None)
+    assert _flag_bits < 1 or code_builder.version >= BytecodeVersion.V_13_2
+    if code_builder.version >= BytecodeVersion.V_13_2:
+        encode_varint(_flag_bits, _buf)
     # Attributes
     code_builder.encode_opattr_str(str)
     # Operands
-    encode_varint(len(args), _buf)
-    encode_unsized_variadic_operands(args, _buf)
-    return code_builder.new_op(0)
+    encode_sized_variadic_operands(args, _buf)
+    encode_optional_operand(token, _buf)
+    results = code_builder.new_op(len(result_types))
+    return None if result_token_idx is None else results[result_token_idx]
 
 
 def encode_PtrToIntOp(
@@ -1726,12 +1771,18 @@ def encode_TanHOp(
     code_builder: CodeBuilder,
     result_type: TypeId,
     source: Value,
+    rounding_mode: RoundingMode,  # since 13.2
 ) -> Value:
     _buf = code_builder.buf
     # Opcode
     encode_varint(106, _buf)
     # Result types
     encode_typeid(result_type, _buf)
+    # Attributes
+    if code_builder.version >= BytecodeVersion.V_13_2:
+        code_builder.encode_opattr_enum(RoundingMode, rounding_mode)
+    else:
+        assert rounding_mode == RoundingMode.FULL
     # Operands
     encode_operand(source, _buf)
     return code_builder.new_op()
@@ -1818,6 +1869,7 @@ __all__ = [
     'encode_AndIOp',
     'encode_AssertOp',
     'encode_AssumeOp',
+    'encode_Atan2Op',
     'encode_AtomicCASTkoOp',
     'encode_AtomicRMWTkoOp',
     'encode_BitcastOp',
@@ -1878,7 +1930,7 @@ __all__ = [
     'encode_OrIOp',
     'encode_PermuteOp',
     'encode_PowOp',
-    'encode_PrintOp',
+    'encode_PrintTkoOp',
     'encode_PtrToIntOp',
     'encode_PtrToPtrOp',
     'encode_ReduceOp',

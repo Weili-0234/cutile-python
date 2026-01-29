@@ -4,6 +4,7 @@
 import inspect
 import math
 import re
+import warnings
 from dataclasses import dataclass
 import datetime
 import functools
@@ -20,6 +21,7 @@ import traceback
 from typing import Callable, Optional, Any, Set, Sequence
 import zipfile
 
+from cuda.tile._bytecode.version import BytecodeVersion
 from cuda.tile._cext import get_compute_capability, TileContext, default_tile_context
 from cuda.tile._compiler_options import CompilerOptions
 from cuda.tile._const_utils import get_constant_annotations
@@ -147,7 +149,8 @@ def _compiler_crash_dump(func_ir: ir.Function,
                          bytecode_generator,
                          error_msg,
                          compiler_flags,
-                         compiler_version):
+                         compiler_version,
+                         bytecode_version: BytecodeVersion):
     debug_info = (
         f"error:\n{error_msg}\n\n"
         f"compiler flags:\n{compiler_flags}\n\n"
@@ -157,7 +160,7 @@ def _compiler_crash_dump(func_ir: ir.Function,
 
     # Anonymize debug attributes in the bytecode
     bytecode_buf = bytearray()
-    with bc.write_bytecode(num_functions=1, buf=bytecode_buf) as writer:
+    with bc.write_bytecode(num_functions=1, buf=bytecode_buf, version=bytecode_version) as writer:
         bytecode_generator(writer, anonymize_debug_attr=True)
 
     artifacts = {
@@ -180,6 +183,8 @@ def compile_tile(pyfunc,
                  args,
                  compiler_options: CompilerOptions,
                  context: TileContext = default_tile_context) -> TileLibrary:
+    bytecode_version = _get_max_supported_bytecode_version(context.config.temp_dir)
+
     param_names = tuple(inspect.signature(pyfunc).parameters.keys())
     ir_args = _bind_kernel_arguments(param_names, args, get_constant_annotations(pyfunc))
     func_ir = _get_final_ir(pyfunc, ir_args, context.config)
@@ -195,7 +200,7 @@ def compile_tile(pyfunc,
                                            func_ir, compiler_options, sm_arch)
 
     bytecode_buf = bytearray()
-    with bc.write_bytecode(num_functions=1, buf=bytecode_buf) as writer:
+    with bc.write_bytecode(num_functions=1, buf=bytecode_buf, version=bytecode_version) as writer:
         bytecode_generator(writer, anonymize_debug_attr=False)
 
     if 'TILEIR' in context.config.log_keys:
@@ -276,8 +281,39 @@ def _local_deps_dir():
     return os.path.join(package_dir, '_deps')
 
 
+@dataclass
+class _CompilerBinary:
+    path: str
+    bin_path: str
+    ld_path: str
+
+    def run(self,
+            args: list[str],
+            flags: list[str],
+            timeout_sec: int | None = None):
+        command = [self.path, *args]
+
+        logger.debug(f"Invoke tile compiler: {' '.join(command + flags)}\n"
+                     f"LD_LIBRARY_PATH:{self.ld_path}\n"
+                     f"PATH:{self.bin_path}")
+        try:
+            env = os.environ.copy()
+            env['LD_LIBRARY_PATH'] = self.ld_path
+            env['PATH'] = self.bin_path
+            subprocess.run(command + flags, env=env, check=True, capture_output=True,
+                           timeout=timeout_sec)
+        except subprocess.CalledProcessError as e:
+            raise TileCompilerExecutionError(e.returncode, e.stderr.decode(), ' '.join(flags),
+                                             _try_get_compiler_version(self.path))
+        except subprocess.TimeoutExpired:
+            message = (f"`tileiras` compiler exceeded timeout {timeout_sec}s. "
+                       "Using a smaller tile size may reduce compilation time.")
+            raise TileCompilerTimeoutError(message, ' '.join(flags),
+                                           _try_get_compiler_version(self.path))
+
+
 @cache
-def _find_compiler_bin() -> tuple[str, str, str]:
+def _find_compiler_bin() -> _CompilerBinary:
     # search under cuda/tile/_deps
     bin_path = os.environ.get('PATH', '')
     ld_path = os.environ.get('LD_LIBRARY_PATH', "") if not is_windows() else ""
@@ -289,12 +325,12 @@ def _find_compiler_bin() -> tuple[str, str, str]:
         if (res := shutil.which("tileiras", path=deps_bin_dir)):
             bin_path = deps_bin_dir + ":" + bin_path
             ld_path = deps_lib_dir + ":" + ld_path
-            return res, bin_path, ld_path
+            return _CompilerBinary(res, bin_path, ld_path)
 
     # search under PATH
     logger.debug(f"Searching tileiras: {bin_path}")
     if (res := shutil.which("tileiras")):
-        return res, bin_path, ld_path
+        return _CompilerBinary(res, bin_path, ld_path)
 
     # search under CUDA_HOME
     if (cuda_home := _get_cuda_home()):
@@ -302,17 +338,44 @@ def _find_compiler_bin() -> tuple[str, str, str]:
         logger.debug(f"Searching tileiras: {cuda_bin_path}")
         if (res := shutil.which("tileiras", path=cuda_bin_path)):
             bin_path = bin_path + ":" + cuda_bin_path
-            return res, bin_path, ld_path
+            return _CompilerBinary(res, bin_path, ld_path)
 
     # Try default CUDA Toolkit installation paths as a fallback
     res = _find_compiler_in_default_cuda_toolkit_paths()
     if res is not None:
         tileiras_path, bin_path = res
-        return tileiras_path, bin_path, ld_path
+        return _CompilerBinary(tileiras_path, bin_path, ld_path)
 
     cuda_home_var = "CUDA_PATH" if is_windows() else "CUDA_HOME"
     raise FileNotFoundError(f"'tileiras' compiler not found, "
                             f"make sure it is available in $PATH or ${cuda_home_var}/bin")
+
+
+@cache
+def _get_max_supported_bytecode_version(temp_dir: str) -> BytecodeVersion:
+    binary = _find_compiler_bin()
+    flags = ["--gpu-name", "sm_120"]
+    for version in reversed(BytecodeVersion):
+        probe = bytearray()
+        with bc.write_bytecode(num_functions=0, buf=probe, version=version):
+            pass
+
+        with tempfile.NamedTemporaryFile(suffix='.bytecode', prefix=f"probe{version}",
+                                         dir=temp_dir, delete=False) as f_in, \
+            tempfile.NamedTemporaryFile(suffix='.cubin', prefix=f"probe{version}",
+                                        dir=temp_dir, delete=False) as f_out:
+            f_in.write(probe)
+
+        try:
+            binary.run([f_in.name, "-o", f_out.name], flags)
+        except TileCompilerError:
+            continue
+
+        return version
+
+    warnings.warn("Failed to detect the maximum supported TileIR bytecode version;"
+                  " falling back to 13.1.")
+    return BytecodeVersion.V_13_1
 
 
 def _find_compiler_in_default_cuda_toolkit_paths() -> tuple[str, str] | None:
@@ -369,16 +432,11 @@ def compile_cubin(
         compiler_options: CompilerOptions,
         sm_arch: str,
         timeout_sec: Optional[int]) -> Path:
-    compiler_bin, bin_path, ld_path = _find_compiler_bin()
+    binary = _find_compiler_bin()
     fname_cubin = Path(fname_bytecode).with_suffix(".cubin")
     compiler_hints = compiler_options.specialize_for_target(sm_arch)
 
-    command = [
-        str(compiler_bin),
-        str(fname_bytecode),
-        "-o",
-        str(fname_cubin),
-    ]
+    args = [str(fname_bytecode), "-o", str(fname_cubin)]
 
     flags = [
         "--gpu-name",
@@ -387,22 +445,5 @@ def compile_cubin(
         "--lineinfo"
     ]
 
-    logger.debug(f"Invoke tile compiler: {' '.join(command + flags)}\n"
-                 f"LD_LIBRARY_PATH:{ld_path}\n"
-                 f"PATH:{bin_path}")
-    try:
-        env = os.environ.copy()
-        env['LD_LIBRARY_PATH'] = ld_path
-        env['PATH'] = bin_path
-        subprocess.run(command + flags, env=env, check=True, capture_output=True,
-                       timeout=timeout_sec)
-    except subprocess.CalledProcessError as e:
-        raise TileCompilerExecutionError(e.returncode, e.stderr.decode(), ' '.join(flags),
-                                         _try_get_compiler_version(compiler_bin))
-    except subprocess.TimeoutExpired:
-        message = (f"`tileiras` compiler exceeded timeout {timeout_sec}s. "
-                   "Using a smaller tile size may reduce compilation time.")
-        raise TileCompilerTimeoutError(message, ' '.join(flags),
-                                       _try_get_compiler_version(compiler_bin))
-
+    binary.run(args, flags, timeout_sec)
     return fname_cubin
