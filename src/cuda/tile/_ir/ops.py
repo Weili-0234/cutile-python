@@ -45,7 +45,8 @@ from .op_impl import (
 from .ops_utils import (
     BINOP_REGISTRY, UNARYOP_REGISTRY,
     check_rd_and_ftz, PaddingMode,
-    rounding_mode_to_bytecode, get_dtype, change_dtype, memory_order_to_bytecode,
+    rounding_mode_to_bytecode, get_default_rounding_mode, get_dtype,
+    change_dtype, memory_order_to_bytecode,
     memory_scope_to_bytecode, broadcast_shapes2, is_shape_broadcastable_to, BroadcastError,
     promote_types, promote_dtypes, check_implicit_cast
 )
@@ -68,6 +69,7 @@ from cuda.tile._ir2bytecode import (
     get_list_partition_view_tile_size, tensor_view_typeid, tensor_view_typeid_for_list, dtype_typeid
 )
 import cuda.tile._bytecode as bc
+from cuda.tile._bytecode.version import BytecodeVersion
 from .._debug import CUDA_TILE_TESTING_DISABLE_DIV
 
 
@@ -689,10 +691,11 @@ class FusedMulAddOperation(Operation):
         lhs = ctx.cast(ctx.get_value(self.lhs), ctx.typeof(self.lhs), result_type)
         rhs = ctx.cast(ctx.get_value(self.rhs), ctx.typeof(self.rhs), result_type)
         acc = ctx.cast(ctx.get_value(self.acc), ctx.typeof(self.acc), result_type)
+        rm = self.rounding_mode if self.rounding_mode is not None else get_default_rounding_mode()
         return bc.encode_FmaOp(ctx.builder,
                                ctx.typeid_of(self.result_var),
                                lhs, rhs, acc,
-                               rounding_mode_to_bytecode[self.rounding_mode],
+                               rounding_mode_to_bytecode[rm],
                                self.flush_to_zero)
 
 
@@ -966,7 +969,8 @@ class RawBinaryArithmeticOperation(TypedOperation):
         dtype = get_dtype(result_ty)
         kind = "float" if datatype.is_float(dtype) else "int"
         res_typeid = typeid(ctx.type_table, result_ty)
-        rounding_mode = rounding_mode_to_bytecode[self.rounding_mode]
+        rm = self.rounding_mode if self.rounding_mode is not None else get_default_rounding_mode()
+        rounding_mode = rounding_mode_to_bytecode[rm]
         lhs = ctx.get_value(self.lhs)
         rhs = ctx.get_value(self.rhs)
 
@@ -1006,6 +1010,8 @@ class RawBinaryArithmeticOperation(TypedOperation):
                                         flush_to_zero=self.flush_to_zero)
             case "pow", "float":
                 return bc.encode_PowOp(ctx.builder, res_typeid, lhs, rhs)
+            case "atan2", "float":
+                return bc.encode_Atan2Op(ctx.builder, res_typeid, lhs, rhs)
             case "min", "int":
                 return bc.encode_MinIOp(ctx.builder, res_typeid, lhs, rhs,
                                         signedness=datatype.get_signedness(dtype))
@@ -1085,6 +1091,11 @@ def binary_arithmetic_impl(fn: str, x: Var, y: Var) -> Var:
 def binary_arithmetic_impl_with_ftz(fn: str, x: Var, y: Var, flush_to_zero: Var) -> Var:
     flush_to_zero = require_constant_bool(flush_to_zero)
     return binary_arithmetic(fn, x, y, flush_to_zero=flush_to_zero)
+
+
+@impl(ct.atan2, min_version=BytecodeVersion.V_13_2)
+def atan2_impl(x1: Var, x2: Var) -> Var:
+    return binary_arithmetic("atan2", x1, x2)
 
 
 @impl(ct.add, fixed_args=["add"])
@@ -1347,7 +1358,9 @@ class Unary(TypedOperation):
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
         x = ctx.get_value(self.operand)
-        rounding_mode = rounding_mode_to_bytecode[self.rounding_mode]
+        rm = (self.rounding_mode if self.rounding_mode is not None
+              else get_default_rounding_mode(self.fn))
+        rounding_mode = rounding_mode_to_bytecode[rm]
         flush_to_zero = self.flush_to_zero
         input_type = ctx.typeof(self.operand)
         input_dtype = get_dtype(input_type)
@@ -1368,9 +1381,8 @@ class Unary(TypedOperation):
             case "sinh", True: return bc.encode_SinHOp(ctx.builder, res_type_id, x)
             case "cosh", True: return bc.encode_CosHOp(ctx.builder, res_type_id, x)
             case "tan", True: return bc.encode_TanOp(ctx.builder, res_type_id, x)
-            # TODO: rounding mode support depending on bytecode version
             case "tanh", True: return bc.encode_TanHOp(ctx.builder, res_type_id, x,
-                                                       rounding_mode=bc.RoundingMode.FULL)
+                                                       rounding_mode=rounding_mode)
             case "log", True: return bc.encode_LogOp(ctx.builder, res_type_id, x)
             case "log2", True: return bc.encode_Log2Op(ctx.builder, res_type_id, x)
             case "sqrt", True: return bc.encode_SqrtOp(ctx.builder, res_type_id, x,
@@ -1486,7 +1498,6 @@ def pos_impl(x: Var):
 @impl(ct.log, fixed_args=["log", _UNARY_FLOAT])
 @impl(ct.log2, fixed_args=["log2", _UNARY_FLOAT])
 @impl(ct.tan, fixed_args=["tan", _UNARY_FLOAT])
-@impl(ct.tanh, fixed_args=["tanh", _UNARY_FLOAT])
 @impl(ct.sin, fixed_args=["sin", _UNARY_FLOAT])
 @impl(ct.sinh, fixed_args=["sinh", _UNARY_FLOAT])
 @impl(ct.cos, fixed_args=["cos", _UNARY_FLOAT])
@@ -1517,6 +1528,12 @@ def unary_impl_with_rd_and_ftz(fn: str, behavior: _UnaryBehavior,
     rounding_mode = require_optional_constant_enum(rounding_mode, RoundingMode)
     flush_to_zero = require_constant_bool(flush_to_zero)
     return unary(fn, behavior, x, rounding_mode=rounding_mode, flush_to_zero=flush_to_zero)
+
+
+@impl(ct.tanh, fixed_args=["tanh", _UNARY_FLOAT])
+def unary_impl_with_rd(fn: str, behavior: _UnaryBehavior, x: Var, rounding_mode: Var) -> Var:
+    rounding_mode = require_optional_constant_enum(rounding_mode, RoundingMode)
+    return unary(fn, behavior, x, rounding_mode=rounding_mode)
 
 
 @impl(getattr)

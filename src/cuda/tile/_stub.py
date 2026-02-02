@@ -1512,6 +1512,30 @@ def pow(x, y, /) -> TileOrScalar:
     pass
 
 
+@function
+def atan2(x1, x2, /) -> TileOrScalar:
+    """Elementwise atan2 of two tiles.
+
+    Computes the element-wise arc tangent of ``x1/x2`` choosing the quadrant correctly.
+
+    Args:
+        x1 (Tile): Numerator tile (y-coordinate).
+        x2 (Tile): Denominator tile (x-coordinate).
+
+    The `shape` of `x1` and `x2` will be broadcasted and
+    `dtype` promoted to common dtype.
+
+    Returns:
+        Tile: The angles in radians, in the range [-pi, pi].
+
+    Examples:
+
+        >>> tx = ct.full((2, 4), 1.0, dtype=ct.float32)
+        >>> ty = ct.full((2, 4), 1.0, dtype=ct.float32)
+        >>> tz = ct.atan2(ty, tx)  # Result is pi/4
+    """
+
+
 @_doc_binary_op('%')
 @function
 def mod(x, y, /) -> TileOrScalar:
@@ -1790,10 +1814,27 @@ def cosh(x, /) -> TileOrScalar:
     pass
 
 
-@_doc_unary_op
 @function
-def tanh(x, /) -> TileOrScalar:
-    pass
+def tanh(x, /, *, rounding_mode: Optional[RoundingMode] = None) -> TileOrScalar:
+    """
+    Perform `tanh` on a tile.
+
+    Args:
+        x (Tile):
+        rounding_mode (RoundingMode): Supported values:
+
+            - ``RoundingMode.FULL``
+            - ``RoundingMode.APPROX`` (since CTK 13.2)
+
+    Returns:
+        Tile:
+
+    Examples:
+
+        >>> tx = ct.full((32, 32), 3.0, dtype=ct.float32)
+        >>> tx = ct.tanh(tx)
+        >>> tx = ct.tanh(tx, rounding_mode=RoundingMode.APPROX)  # Faster approximation
+    """
 
 
 @_doc_unary_op

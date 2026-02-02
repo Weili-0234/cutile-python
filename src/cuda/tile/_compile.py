@@ -79,10 +79,11 @@ def global_compiler_lock(func):
 
 def _get_final_ir(pyfunc,
                   args: Sequence[ir.KernelArgument],
-                  config: TileContextConfig) -> ir.Function:
+                  config: TileContextConfig,
+                  tileiras_version: BytecodeVersion = BytecodeVersion.V_13_1) -> ir.Function:
     func_hir: hir.Function = get_function_hir(pyfunc, entry_point=True)
 
-    ir_ctx = ir.IRContext(config)
+    ir_ctx = ir.IRContext(config, tileiras_version)
     func_body = hir2ir(func_hir, args, ir_ctx)
     eliminate_assign_ops(func_body)
     dead_code_elimination_pass(func_body)
@@ -188,7 +189,7 @@ def compile_tile(pyfunc,
 
     param_names = tuple(inspect.signature(pyfunc).parameters.keys())
     ir_args = _bind_kernel_arguments(param_names, args, get_constant_annotations(pyfunc))
-    func_ir = _get_final_ir(pyfunc, ir_args, context.config)
+    func_ir = _get_final_ir(pyfunc, ir_args, context.config, bytecode_version)
 
     if 'CUTILEIR' in context.config.log_keys:
         code = (f"==== CuTile IR for {func_ir.name}==== \n\n"

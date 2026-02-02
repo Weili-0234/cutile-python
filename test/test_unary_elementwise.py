@@ -8,7 +8,8 @@ import math
 from torch.testing import make_tensor
 
 from util import launch_unary, assert_equal, assert_close, jit_kernel, filecheck, get_bytecode
-from conftest import float_dtypes, int_dtypes, bool_dtypes, dtype_id
+from conftest import float_dtypes, int_dtypes, bool_dtypes, dtype_id, requires_tileiras
+from cuda.tile._bytecode.version import BytecodeVersion
 from cuda.tile._exception import TileTypeError
 from cuda.tile._numeric_semantics import RoundingMode as RMd
 
@@ -330,3 +331,35 @@ def test_scalar_rounding(shape, tile, is_constant, dtype, op, tmp_path):
         kernel = const_scalar_kernel(op, dtype_str, f'c = ct.{op}(x)', tmp_path)
     launch_unary(kernel, x, y, tile)
     assert_equal(y, getattr(math, op)(x))
+
+
+@requires_tileiras(BytecodeVersion.V_13_2)
+@pytest.mark.use_mlir
+@pytest.mark.parametrize("dtype", float_dtypes, ids=dtype_id)
+@pytest.mark.parametrize("rounding_mode", [RMd.FULL, RMd.APPROX])
+def test_array_tanh_rounding_mode(shape, tile, dtype, rounding_mode, tmp_path):
+    should_raise_dtype = rounding_mode in [RMd.FULL, RMd.APPROX] and dtype != torch.float32
+    x = make_tensor(shape, dtype=dtype, device='cuda')
+    y_ref = torch.tanh(x)
+    y = torch.zeros_like(y_ref, device="cuda")
+    kernel = array_kernel("tanh_rounding_mode",
+                          f"ty = ct.tanh(tx, rounding_mode={rounding_mode})",
+                          tmp_path,
+                          globals={"RoundingMode": RMd})
+    if should_raise_dtype:
+        with pytest.raises(TileTypeError,
+                           match=fr"Rounding mode {rounding_mode.value} can only be used for "
+                           "float32 type"):
+            launch_unary(kernel, x, y, tile)
+    else:
+        bytecode = get_bytecode(kernel, (x, y, tile))
+        if rounding_mode is RMd.FULL:
+            # FULL is the default, not included in mlir text
+            check_directive = "// CHECK: %[[RES:.*]] = tanh %[[A:.*]]{{[[:space:]]*}}:"
+        else:
+            check_directive = (
+                f"// CHECK: %[[RES:.*]] = tanh %[[A:.*]] rounding<{rounding_mode.value}>"
+            )
+        filecheck(bytecode, check_directive)
+        launch_unary(kernel, x, y, tile)
+        assert_close(y, y_ref)

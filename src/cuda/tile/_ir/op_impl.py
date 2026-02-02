@@ -12,11 +12,12 @@ from typing import Optional, NamedTuple, Tuple, Sequence, Any, Union, Callable
 from cuda.tile._datatype import (
         is_integral, is_float, is_restricted_float,
         is_boolean, is_signed, DType)
-from cuda.tile._exception import TileTypeError
+from cuda.tile._bytecode.version import BytecodeVersion
+from cuda.tile._exception import TileTypeError, TileUnsupportedFeatureError
 from cuda.tile._ir.ops_utils import get_dtype
 
 from .typing_support import datatype, get_signature
-from .ir import Var, TupleValue
+from .ir import Var, TupleValue, Builder
 from .type import TupleTy, TileTy, DTypeSpec, EnumTy, StringTy, ArrayTy, SliceType, \
     ListTy, LooselyTypedScalar, RangeIterType, FunctionTy, ClosureTy, BoundMethodTy, \
     DTypeConstructor, Type
@@ -36,8 +37,18 @@ def _verify_params_match(stub_sig: inspect.Signature, func_sig: inspect.Signatur
 op_implementations = dict()
 
 
-def impl(stub, *, fixed_args: Sequence[Any] = ()):
+def impl(stub, *, fixed_args: Sequence[Any] = (),
+         min_version: Optional[BytecodeVersion] = None):
     stub_sig = get_signature(stub)
+
+    def _check_version():
+        cur_version = Builder.get_current().ir_ctx.tileiras_version
+        if min_version is not None and cur_version < min_version:
+            raise TileUnsupportedFeatureError(
+                f"{stub.__name__} requires tileiras "
+                f"{min_version.major()}.{min_version.minor()} or later. "
+                f"Current version is {cur_version.major()}.{cur_version.minor()}."
+            )
 
     def decorate(func):
         orig_func = func
@@ -50,6 +61,7 @@ def impl(stub, *, fixed_args: Sequence[Any] = ()):
         if is_coroutine:
             @functools.wraps(func)
             async def wrapper(*args, **kwargs):
+                _check_version()
                 # Memorize the stub and the args so that we can automatically
                 # provide context for error messages.
                 old = _current_stub.stub_and_args
@@ -61,6 +73,7 @@ def impl(stub, *, fixed_args: Sequence[Any] = ()):
         else:
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
+                _check_version()
                 # Memorize the stub and the args so that we can automatically
                 # provide context for error messages.
                 old = _current_stub.stub_and_args

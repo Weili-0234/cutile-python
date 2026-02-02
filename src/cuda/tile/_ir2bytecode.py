@@ -240,7 +240,8 @@ def lower_scan(ctx: "BytecodeContext", x: bc.Value, input_ty: Type,
 
     element_tile_typeid = tt.tile(element_type_id, ())
     with nested_builder.new_block((element_tile_typeid, element_tile_typeid)) as (a, b):
-        rounding_mode_bc = rounding_mode_to_bytecode[rounding_mode]
+        rm = rounding_mode if rounding_mode is not None else get_default_rounding_mode()
+        rounding_mode_bc = rounding_mode_to_bytecode[rm]
         match scan_fn, use_float:
             case "add", True:
                 res = bc.encode_AddFOp(ctx.builder, element_tile_typeid, a, b,
