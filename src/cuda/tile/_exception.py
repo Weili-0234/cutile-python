@@ -155,6 +155,11 @@ class TileInternalError(TileError):
     pass
 
 
+class TileStaticEvalError(TileError):
+    """Thrown at compile time when the expression inside static_eval() violates the compile-time
+    evaluation constraints."""
+
+
 class ConstantNotFoundError(Exception):
     pass
 

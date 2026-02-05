@@ -304,10 +304,11 @@ def _get_callee_and_self(callee_var: Var) -> tuple[Any, tuple[()] | tuple[Var]]:
         raise TileTypeError(f"Cannot call an object of type {callee_ty}")
 
 
-def _resolve_operand(x: hir.Operand, scope: Scope) -> Var | hir.Block | hir.Function:
+def _resolve_operand(x: hir.Operand, scope: Scope) \
+        -> Var | hir.Block | hir.Function | hir.StaticEvalExpression:
     if isinstance(x, hir.Value):
         return scope.hir2ir_varmap[x.id]
-    elif isinstance(x, hir.Block | hir.Function):
+    elif isinstance(x, hir.Block | hir.Function | hir.StaticEvalExpression):
         return x
     else:
         return loosely_typed_const(x)

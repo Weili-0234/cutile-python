@@ -189,3 +189,12 @@ Utility
 
    printf
    assert_
+
+
+Metaprogramming Support
+-----------------------
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   static_eval

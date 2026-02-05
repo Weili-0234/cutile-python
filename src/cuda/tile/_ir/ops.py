@@ -13,10 +13,10 @@ from typing import (
 from typing_extensions import override
 
 import cuda.tile._stub as ct
-from cuda.tile import _datatype as datatype, TileValueError
+from cuda.tile import _datatype as datatype, TileValueError, TileStaticEvalError
 from cuda.tile import RoundingMode, MemoryOrder, MemoryScope
 from cuda.tile._mutex import tile_mutex
-from cuda.tile._exception import TileTypeError, TileSyntaxError
+from cuda.tile._exception import TileTypeError, TileSyntaxError, TileError
 from cuda.tile._ir.ir import (
     Operation, Var, Loc, Block,
     terminator, add_operation, TypedOperation, Builder,
@@ -73,6 +73,8 @@ from cuda.tile._ir2bytecode import (
 import cuda.tile._bytecode as bc
 from cuda.tile._bytecode.version import BytecodeVersion
 from .._debug import CUDA_TILE_TESTING_DISABLE_DIV
+from .._dispatch_mode import StaticEvalMode
+from .._symbolic import SymbolicTile, SymbolicArray, Symbol, SymbolicClosure
 
 
 # ================================================
@@ -4152,3 +4154,59 @@ def make_closure_impl(func_hir: hir.Function, default_values: tuple[Var, ...]):
                            tuple(frozen_capture_types_by_depth))
     closure_val = ClosureValue(default_values, tuple(frozen_captures_by_depth))
     return make_aggregate(closure_val, closure_ty)
+
+
+@impl(ct.static_eval)
+def static_eval_impl(expr: Var):
+    raise TileSyntaxError("static_eval() must be used directly by name,"
+                          " e.g. cuda.tile.static_eval() or ct.static_eval().")
+
+
+@impl(hir.do_static_eval)
+def do_static_eval_impl(expr: hir.StaticEvalExpression, local_var_values: tuple[Var, ...]) -> Var:
+    local_proxies = tuple(var2sym(x) for x in local_var_values)
+    with StaticEvalMode().as_current():
+        try:
+            result = expr.compiled_expr(*local_proxies)
+        except TileError:
+            raise
+        except Exception as e:
+            msg = f"Exception was raised inside static_eval() ({type(e).__name__}"
+            e_str = str(e)
+            if len(e_str) > 0:
+                msg += ": " + e_str
+            msg += ")"
+            raise TileStaticEvalError(msg) from e
+    return sym2var(result)
+
+
+def var2sym(var: Var) -> Any:
+    if var.is_constant():
+        return var.get_constant()
+
+    ty = var.get_type()
+    if isinstance(ty, TileTy | DType):
+        return SymbolicTile(var)
+    elif isinstance(ty, ArrayTy):
+        return SymbolicArray(var)
+    elif isinstance(ty, TupleTy):
+        tup_val = var.get_aggregate()
+        assert isinstance(tup_val, TupleValue)
+        return tuple(var2sym(x) for x in tup_val.items)
+    elif isinstance(ty, ClosureTy):
+        return SymbolicClosure(var)
+    else:
+        raise NotImplementedError(f"Objects of type {ty} are not supported at compile time")
+
+
+def sym2var(x: Any) -> Var:
+    # TODO: verify we don't have a stale closure
+
+    if isinstance(x, Symbol):
+        return x._var
+
+    if isinstance(x, tuple):
+        return build_tuple(tuple(sym2var(item) for item in x))
+
+    x = get_constant_value(x)
+    return loosely_typed_const(x)

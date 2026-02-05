@@ -9,13 +9,15 @@ import operator
 from contextlib import contextmanager
 from enum import Enum, auto
 from functools import lru_cache
-from typing import List, Sequence, Optional, Any, Dict, Type, Callable, OrderedDict
+from typing import List, Sequence, Optional, Any, Dict, Type, Callable, OrderedDict, Mapping
 
 from cuda.tile import _datatype as datatype
 from cuda.tile._exception import TileSyntaxError, Loc, FunctionDesc
 from cuda.tile._ir.hir import make_value, ResolvedName, UNKNOWN_NAME
 from cuda.tile._ir import hir
 from cuda.tile._ir.type import ClosureDefaultPlaceholder
+from cuda.tile._passes.ast_util import ast_get_all_local_names
+from cuda.tile._stub import static_eval
 
 
 @lru_cache
@@ -50,6 +52,7 @@ def get_function_hir(pyfunc: Callable, entry_point: bool) -> hir.Function:
     assert len(mod.body[0].body) == 1
     func_def = mod.body[0].body[0]
     assert isinstance(func_def, ast.FunctionDef)
+    _fix_line_numbers(func_def, first_line)
 
     func_globals = dict(pyfunc.__builtins__)
     func_globals.update(pyfunc.__globals__)
@@ -60,16 +63,31 @@ def get_function_hir(pyfunc: Callable, entry_point: bool) -> hir.Function:
 
     filename = inspect.getfile(pyfunc)
     desc = FunctionDesc(func_def.name, filename, first_line)
-    frozen_global_names = tuple(sorted(func_globals.keys()))
-    frozen_global_values = tuple(func_globals[name] for name in frozen_global_names)
-    ctx = _Context(filename, first_line, desc, frozen_global_names, frozen_global_values,
-                   entry_point)
+    local_names, _, _ = ast_get_all_local_names(func_def)
+    ctx = _Context(filename, first_line, desc, func_globals, local_names, entry_point)
     signature = inspect.signature(pyfunc)
     ret = _get_function_hir_inner(func_def, signature, ctx)
 
-    resolved_names = {name: ResolvedName(-1, i) for i, name in enumerate(frozen_global_names)}
+    resolved_names = {name: ResolvedName(-1, i) for i, name in enumerate(ret.frozen_global_names)}
     _finalize_func(ret, resolved_names, 0, ())
     return ret
+
+
+# Translate the 1-based line numbers of the chunk we passed to the AST parser
+# to the original 1-based line numbers in the file.
+def _fix_line_numbers(tree: ast.AST, first_line: int):
+    for node in ast.walk(tree):
+        if hasattr(node, "lineno"):
+            # Why -2?
+            #    -1 because both first_line and node.lineno are 1-based;
+            #    another -1 to account for the "if True" line that we inserted.
+            node.lineno += first_line - 2
+            node.end_lineno += first_line - 2
+
+            # Subtract 1 from the column offset to correct for an extra level
+            # of indentation we inserted for the dummy "if True" block.
+            node.col_offset -= 1
+            node.end_col_offset -= 1
 
 
 def _finalize_func(func: hir.Function, resolved_names: dict[str, ResolvedName], depth: int,
@@ -104,6 +122,8 @@ def _get_function_hir_inner(func_def: ast.FunctionDef | ast.Lambda, signature: i
     param_names = tuple(p.arg for p in all_ast_args)
     body.stored_names.update(param_names)
     local_names = tuple(sorted(body.stored_names))
+    frozen_global_names = tuple(sorted(ctx.frozen_globals.keys()))
+    frozen_global_values = tuple(ctx.frozen_globals[name] for name in frozen_global_names)
     return hir.Function(
         desc=ctx.function_desc,
         body=body,
@@ -111,24 +131,16 @@ def _get_function_hir_inner(func_def: ast.FunctionDef | ast.Lambda, signature: i
         local_names=local_names,
         param_local_indices=tuple(local_names.index(name) for name in param_names),
         param_locs=tuple(ctx.get_loc(p) for p in all_ast_args),
-        frozen_global_names=ctx.frozen_global_names,
-        frozen_global_values=ctx.frozen_global_values,
+        frozen_global_names=frozen_global_names,
+        frozen_global_values=frozen_global_values,
         value_id_upper_bound=next(ctx.value_id_sequence),
         nested_functions=tuple(ctx.nested_functions),
         loaded_names=tuple(sorted(ctx.loaded_names)),
         used_names=OrderedDict(),  # to be filled later
         captures_by_depth=(),  # to be filled later
         enclosing_funcs=(),  # to be filled later
+        code_object=None,  # to be maybe filled later
     )
-
-
-# Translate the 1-based line number of the chunk we passed to the AST parser
-# to the original 1-based line number in the file.
-def _get_source_line_no(first_line_no: int, ast_line_no: int):
-    # Why -2?
-    #    -1 because both first_line_no and ast_line_no are 1-based;
-    #    another -1 to account for the "if True" line that we inserted.
-    return first_line_no + ast_line_no - 2
 
 
 class LoopKind(Enum):
@@ -138,13 +150,12 @@ class LoopKind(Enum):
 
 class _Context:
     def __init__(self, filename: str, first_line: int, function_desc: FunctionDesc,
-                 frozen_global_names: tuple[str, ...], frozen_global_values: tuple[Any, ...],
-                 entry_point: bool):
+                 frozen_globals: Mapping[str, Any], local_names: set[str], entry_point: bool):
         self.filename = filename
         self.first_line = first_line
         self.function_desc = function_desc
-        self.frozen_global_names = frozen_global_names
-        self.frozen_global_values = frozen_global_values
+        self.frozen_globals = frozen_globals
+        self.local_names = local_names  # includes captures from parent scopes
         self.entry_point = entry_point
         self.parent_loops: List[LoopKind] = []
         self.current_loc = Loc.unknown()
@@ -209,12 +220,8 @@ class _Context:
         return self.call(hir.load_var, (var_name,))
 
     def get_loc(self, node: ast.AST) -> Loc:
-        line_no = _get_source_line_no(self.first_line, node.lineno)
-        last_line_no = _get_source_line_no(self.first_line, node.end_lineno)
-        # Subtract 1 from the column offset to correct for an extra level
-        # of indentation we inserted for the dummy "if True" block.
-        return Loc(line_no, node.col_offset - 1, self.filename,
-                   last_line_no, node.end_col_offset - 1, self.function_desc)
+        return Loc(node.lineno, node.col_offset, self.filename,
+                   node.end_lineno, node.end_col_offset, self.function_desc)
 
     def syntax_error(self, message: str, loc=None) -> TileSyntaxError:
         if loc is None:
@@ -242,10 +249,103 @@ _expr_handlers: Dict[Type[ast.AST], Callable] = {}
 
 @_register(_expr_handlers, ast.Call)
 def _call_expr(call: ast.Call, ctx: _Context) -> hir.Value:
-    callee = _expr(call.func, ctx)
-    args = tuple(_expr(a, ctx) for a in call.args)
-    kwargs = tuple((a.arg, _expr(a.value, ctx)) for a in call.keywords)
-    return ctx.call(callee, args, kwargs)
+    if _is_static_eval_func(call.func, ctx):
+        if len(call.args) != 1 or len(call.keywords) != 0:
+            raise ctx.syntax_error("static_eval() expects a single expression")
+        return _call_static_eval(call.args[0], ctx)
+    else:
+        callee = _expr(call.func, ctx)
+        args = tuple(_expr(a, ctx) for a in call.args)
+        kwargs = tuple((a.arg, _expr(a.value, ctx)) for a in call.keywords)
+        return ctx.call(callee, args, kwargs)
+
+
+def _call_static_eval(expr: ast.expr, ctx: _Context) -> hir.Value:
+    # Wrap the `expr` as `lambda: expr`
+    inner_lambda_ast = _wrap_in_lambda(expr, ())
+
+    # Wrap with another lambda that takes all local names as arguments:
+    #     `lambda local1, local2, ...: lambda: expr`
+    local_names = sorted(ctx.local_names)
+    outer_lambda_ast = _wrap_in_lambda(inner_lambda_ast, local_names)
+
+    # Compile and eval the AST to get an instance of the outer lambda function
+    outer_lambda = _eval_ast_expr(outer_lambda_ast, ctx)
+
+    # Call the outer lambda to create an instance of the inner lambda
+    inner_lambda = outer_lambda(*tuple(None for _ in local_names))
+
+    # Make sure the function doesn't store any locals, e.g. using the walrus operator
+    if len(inner_lambda.__code__.co_varnames) > 0:
+        name = inner_lambda.__code__.co_varnames[0]
+        raise TileSyntaxError(f"static_eval() expression attempted"
+                              f" to modify a local variable '{name}'")
+
+    # Look at the inner lambda's freevars to determine which locals are being used
+    used_locals = sorted(inner_lambda.__code__.co_freevars)
+
+    # Compile a new lambda function of the form
+    #    lambda p1, p2, ...: expr
+    # Where p1, p2, ... are the names of used local variables.
+    final_lambda_ast = _wrap_in_lambda(expr, used_locals)
+    final_lambda = _eval_ast_expr(final_lambda_ast, ctx)
+
+    loaded_locals = tuple(ctx.load(local_name) for local_name in used_locals)
+    return ctx.call(hir.do_static_eval, (hir.StaticEvalExpression(final_lambda), *loaded_locals))
+
+
+def _wrap_in_call(lamb: ast.Lambda) -> ast.Call:
+    return ast.Call(func=lamb, args=[], keywords=[], lineno=lamb.lineno, end_lineno=lamb.end_lineno,
+                    col_offset=lamb.col_offset, end_col_offset=lamb.end_col_offset)
+
+
+def _wrap_in_lambda(expr: ast.expr, param_names: Sequence[str]) -> ast.Lambda:
+    locals_as_ast_args = [ast.arg(arg=name, lineno=0, col_offset=0) for name in param_names]
+    outer_lambda_args = ast.arguments(posonlyargs=locals_as_ast_args, args=[], vararg=None,
+                                      kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[])
+    return ast.Lambda(args=outer_lambda_args, body=expr,
+                      lineno=expr.lineno, end_lineno=expr.end_lineno,
+                      col_offset=expr.col_offset, end_col_offset=expr.end_col_offset)
+
+
+def _eval_ast_expr(expr: ast.expr, ctx: _Context):
+    ast_to_eval = ast.Expression(body=expr)
+    try:
+        code = compile(ast_to_eval, ctx.filename, "eval")
+    except (SyntaxError, ValueError) as e:
+        # TODO: get location info from SyntaxError
+        raise TileSyntaxError(str(e))
+
+    return eval(code, dict(ctx.frozen_globals), {})
+
+
+def _is_static_eval_func(func: ast.expr, ctx: _Context) -> bool:
+    if isinstance(func, ast.Name):
+        return (func.id not in ctx.local_names
+                and ctx.frozen_globals.get(func.id) is static_eval)
+    elif isinstance(func, ast.Attribute):
+        return func.attr == "static_eval" and _is_cuda_tile_module(func.value, ctx)
+    else:
+        return False
+
+
+def _is_cuda_tile_module(value: ast.expr, ctx: _Context) -> bool:
+    if isinstance(value, ast.Name):
+        if value.id in ctx.local_names:
+            return False
+        import cuda.tile
+        return ctx.frozen_globals.get(value.id) is cuda.tile
+    elif isinstance(value, ast.Attribute):
+        return value.attr == "tile" and _is_cuda_module(value.value, ctx)
+    else:
+        return False
+
+
+def _is_cuda_module(value: ast.expr, ctx: _Context) -> bool:
+    if not isinstance(value, ast.Name):
+        return False
+    import cuda
+    return ctx.frozen_globals.get(value.id) is cuda
 
 
 @_register(_expr_handlers, ast.Name)
@@ -628,15 +728,53 @@ def _pass_stmt(stmt: ast.Pass, ctx: _Context) -> None:
 def _make_closure(node: ast.FunctionDef | ast.Lambda, ctx: _Context) -> hir.Value:
     signature, default_exprs = _signature_from_ast_arguments(node.args)
     default_values = tuple(_expr(x, ctx) for x in default_exprs)
-    line_no = _get_source_line_no(ctx.first_line, node.lineno)
+    line_no = node.lineno
     name = None if isinstance(node, ast.Lambda) else node.name
     desc = FunctionDesc(name, ctx.filename, line_no)
-    new_ctx = _Context(ctx.filename, ctx.first_line, desc, ctx.frozen_global_names,
-                       ctx.frozen_global_values, entry_point=False)
+    new_locals, new_globals, _ = ast_get_all_local_names(node)
+    local_names = (ctx.local_names - new_globals) | new_locals
+    new_ctx = _Context(ctx.filename, ctx.first_line, desc, ctx.frozen_globals,
+                       local_names, entry_point=False)
 
     func_hir = _get_function_hir_inner(node, signature, new_ctx)
+    func_hir.code_object = (_compile_lambda(node, ctx.filename) if isinstance(node, ast.Lambda)
+                            else _compile_nested_function_def(node, ctx.filename)).__code__
+
     ctx.nested_functions.append(func_hir)
     return ctx.call(hir.make_closure, (func_hir, *default_values))
+
+
+def _compile_lambda(node: ast.Lambda, filename: str):
+    node = ast.Lambda(args=_flatten_parameters(node.args), body=node.body,
+                      lineno=node.lineno, col_offset=node.col_offset,
+                      end_lineno=node.end_lineno, end_col_offset=node.end_col_offset)
+    container = ast.Expression(node)
+    code = compile(container, filename, "eval")
+    return eval(code, {}, {})
+
+
+def _compile_nested_function_def(node: ast.FunctionDef, filename: str):
+    node = ast.FunctionDef(name=node.name, args=_flatten_parameters(node.args),
+                           body=node.body, decorator_list=[],
+                           returns=None, type_comment=None,
+                           lineno=node.lineno, col_offset=node.col_offset,
+                           end_lineno=node.end_lineno, end_col_offset=node.end_col_offset)
+    container = ast.Module(body=[node], type_ignores=[])
+    code = compile(container, filename, "exec")
+    locals_dict = {}
+    exec(code, {}, locals_dict)
+    return locals_dict[node.name]
+
+
+def _flatten_parameters(args: ast.arguments) -> ast.arguments:
+    all_args = args.posonlyargs + args.args
+    if args.vararg is not None:
+        all_args.append(args.vararg)
+    all_args += args.kwonlyargs
+    if args.kwarg is not None:
+        all_args.append(args.kwarg)
+    return ast.arguments(posonlyargs=[], args=all_args, vararg=None, kwonlyargs=[], kw_defaults=[],
+                         kwarg=None, defaults=[])
 
 
 @_register(_stmt_handlers, ast.FunctionDef)
