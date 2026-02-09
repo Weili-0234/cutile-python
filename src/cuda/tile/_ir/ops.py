@@ -124,7 +124,7 @@ class Loop(TypedOperation):
         if self.is_for_loop:
             start, stop, step = (ctx.get_value(x) for x in (self.start, self.stop, self.step))
             nested_builder = bc.encode_ForOp(ctx.builder, result_type_ids, start, stop, step,
-                                             initial_values)
+                                             initial_values, unsignedCmp=False)
             induction_var_type_id = ctx.typeid_of(self.induction_var)
             block_arg_type_ids = (induction_var_type_id, *result_type_ids)
         else:
@@ -1359,7 +1359,8 @@ class Unary(TypedOperation):
             case "abs", True: return bc.encode_AbsFOp(ctx.builder, res_type_id, x)
             case "abs", False: return bc.encode_AbsIOp(ctx.builder, res_type_id, x)
             case "neg", True: return bc.encode_NegFOp(ctx.builder, res_type_id, x)
-            case "neg", False: return bc.encode_NegIOp(ctx.builder, res_type_id, x)
+            case "neg", False: return bc.encode_NegIOp(ctx.builder, res_type_id, x,
+                                                       bc.IntegerOverflow.NONE)
             case "exp", True: return bc.encode_ExpOp(ctx.builder, res_type_id, x)
             case "exp2", True: return bc.encode_Exp2Op(ctx.builder, res_type_id, x,
                                                        flush_to_zero=flush_to_zero)
@@ -1368,7 +1369,9 @@ class Unary(TypedOperation):
             case "sinh", True: return bc.encode_SinHOp(ctx.builder, res_type_id, x)
             case "cosh", True: return bc.encode_CosHOp(ctx.builder, res_type_id, x)
             case "tan", True: return bc.encode_TanOp(ctx.builder, res_type_id, x)
-            case "tanh", True: return bc.encode_TanHOp(ctx.builder, res_type_id, x)
+            # TODO: rounding mode support depending on bytecode version
+            case "tanh", True: return bc.encode_TanHOp(ctx.builder, res_type_id, x,
+                                                       rounding_mode=bc.RoundingMode.FULL)
             case "log", True: return bc.encode_LogOp(ctx.builder, res_type_id, x)
             case "log2", True: return bc.encode_Log2Op(ctx.builder, res_type_id, x)
             case "sqrt", True: return bc.encode_SqrtOp(ctx.builder, res_type_id, x,
@@ -2337,9 +2340,9 @@ def pointer_offset(pointer: Var, offset: Var) -> Var:
 
 
 @impl(ct.gather)
-def gather_impl(array: Var, indices: Var, padding_value: Var, check_bounds: Var,
-                latency: Var) -> Var:
-    pointer, mask = _gather_scatter_pointer_and_mask(array, indices, check_bounds)
+def gather_impl(array: Var, indices: Var, mask: Var, padding_value: Var,
+                check_bounds: Var, latency: Var) -> Var:
+    pointer, final_mask = _gather_scatter_pointer_and_mask(array, indices, check_bounds, mask)
     pointer_ty = pointer.get_type()
     pointer_shape = pointer_ty.shape_value if isinstance(pointer_ty, TileTy) else ()
 
@@ -2357,12 +2360,13 @@ def gather_impl(array: Var, indices: Var, padding_value: Var, check_bounds: Var,
     # Handle the latency hint
     latency = require_optional_constant_int(latency)
     check_load_store_hints(latency)
-    return load_pointer(pointer, mask, padding_value, latency)
+    return load_pointer(pointer, final_mask, padding_value, latency)
 
 
 @impl(ct.scatter)
-def scatter_impl(array: Var, indices: Var, value: Var, check_bounds: Var, latency: Var):
-    pointer, mask = _gather_scatter_pointer_and_mask(array, indices, check_bounds)
+def scatter_impl(array: Var, indices: Var, value: Var, mask: Var,
+                 check_bounds: Var, latency: Var):
+    pointer, final_mask = _gather_scatter_pointer_and_mask(array, indices, check_bounds, mask)
     pointer_ty = pointer.get_type()
     pointer_shape = pointer_ty.shape_value if isinstance(pointer_ty, TileTy) else ()
 
@@ -2374,7 +2378,7 @@ def scatter_impl(array: Var, indices: Var, value: Var, check_bounds: Var, latenc
     latency = require_optional_constant_int(latency)
     check_load_store_hints(latency)
 
-    store_pointer(pointer, value, mask, latency)
+    store_pointer(pointer, value, final_mask, latency)
 
 
 def _get_scatter_value(value: Var, pointer_shape: Tuple[int, ...], array_dtype: DType,
@@ -2392,9 +2396,52 @@ def _get_scatter_value(value: Var, pointer_shape: Tuple[int, ...], array_dtype: 
     return broadcast_to(value, pointer_shape)
 
 
-def _gather_scatter_pointer_and_mask(array: Var,
-                                     indices: Var,
-                                     check_bounds: Var) -> Tuple[Var, Optional[Var]]:
+def _process_custom_mask(mask: Optional[Var], bounds_mask: Optional[Var],
+                         pointer_shape: Tuple[int, ...]) -> Optional[Var]:
+    """
+    Process and validate the custom mask parameter for gather/scatter operations.
+
+    Args:
+        mask: The user-provided mask (can be Python None or Var containing None)
+        bounds_mask: The generated bounds-checking mask based on indices (or None)
+        pointer_shape: The target shape that the mask should be broadcast to
+
+    Returns:
+        The final mask to use (custom AND bounds, or just one of them, or None)
+    """
+    # Check if mask is None (either Python None or Var containing None)
+    if mask is None or (mask.is_constant() and mask.get_constant() is None):
+        # No custom mask provided, return the bounds mask
+        return bounds_mask
+
+    # Validate the mask type
+    mask_ty = require_tile_or_scalar_type(mask)
+    mask_dtype = get_dtype(mask_ty)
+
+    if not is_boolean(mask_dtype):
+        raise TileTypeError(f"Custom mask must have boolean dtype, but got {mask_dtype}")
+
+    # Check that mask shape is broadcastable
+    mask_shape = mask_ty.shape_value if isinstance(mask_ty, TileTy) else ()
+    if not is_shape_broadcastable_to(mask_shape, pointer_shape):
+        raise TileTypeError(f"Custom mask shape {mask_shape} is not broadcastable"
+                            f" to the index shape {pointer_shape}")
+
+    # Broadcast the mask to the pointer shape
+    mask = broadcast_to(mask, pointer_shape)
+
+    # Combine with bounds mask if both exist
+    if bounds_mask is None:
+        return mask
+    else:
+        return binary_bitwise("and_", bounds_mask, mask)
+
+
+def _gather_scatter_pointer_and_mask(
+        array: Var,
+        indices: Var,
+        check_bounds: Var,
+        custom_mask: Optional[Var] = None) -> Tuple[Var, Optional[Var]]:
     check_bounds = require_constant_bool(check_bounds)
     array_ty = require_array_type(array)
     indices_ty = require_index_or_index_tuple_type(indices,
@@ -2472,10 +2519,15 @@ def _gather_scatter_pointer_and_mask(array: Var,
     # Offset the base pointer
     if offset is None:
         # 0-D array case
-        return array_val.base_ptr, None
+        pointer = array_val.base_ptr
+        pointer_shape = ()
     else:
         pointer = pointer_offset(array_val.base_ptr, offset)
-        return pointer, mask
+        pointer_shape = common_shape
+
+    # Process custom mask and combine with bounds mask
+    final_mask = _process_custom_mask(custom_mask, mask, pointer_shape)
+    return pointer, final_mask
 
 
 @memory_effect(MemoryEffect.STORE)
@@ -3473,7 +3525,9 @@ class TilePrintf(TypedOperation):
     def generate_bytecode(self, ctx: BytecodeContext):
         arg_vars = [ctx.get_value(arg) for arg in self.args]
         with tile_mutex("print_mutex", ctx):
-            bc.encode_PrintOp(ctx.builder, arg_vars, self.format)
+            result_typeid = (ctx.type_table.Token
+                             if ctx.builder.version >= bc.BytecodeVersion.V_13_2 else None)
+            bc.encode_PrintTkoOp(ctx.builder, result_typeid, arg_vars, None, self.format)
         return []
 
 

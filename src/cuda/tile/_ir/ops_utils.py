@@ -86,6 +86,7 @@ UNARYOP_REGISTRY = {
     "cos": MathOpDef(math.cos),
     "cosh": MathOpDef(math.cosh),
     "tan": MathOpDef(math.tan),
+    # TODO: RoundingMode support dependent on bytecode version
     "tanh": MathOpDef(math.tanh),
     "log": MathOpDef(math.log),
     "log2": MathOpDef(math.log2),

@@ -12,9 +12,7 @@ from .code_builder import CodeBuilder, Value
 from .constant import ConstantTable
 from .debug_info import DebugAttrId, DebugAttrTable
 from .type import TypeTable, TypeId, encode_typeid
-
-
-_BYTECODE_VERSION = (13, 1, 0)
+from .version import BytecodeVersion
 
 
 class FunctionBuilder(NamedTuple):
@@ -44,7 +42,7 @@ class GlobalSection:
 
 
 class BytecodeWriter:
-    def __init__(self, buf: bytearray):
+    def __init__(self, buf: bytearray, version: BytecodeVersion):
         self._num_functions = 0
         self.debug_info = []
         self._buf = buf
@@ -53,6 +51,7 @@ class BytecodeWriter:
         self._constant_table = ConstantTable()
         self._type_table = TypeTable()
         self._global_section = GlobalSection(self._string_table, self._constant_table)
+        self.version = version
 
     @property
     def debug_attr_table(self) -> DebugAttrTable:
@@ -90,6 +89,7 @@ class BytecodeWriter:
             make_entry_hints(hints).encode_tagged(self._string_table, self._buf)
 
         builder = CodeBuilder(buf=bytearray(),
+                              version=self.version,
                               string_table=self._string_table,
                               constant_table=self._constant_table,
                               debug_attr_per_op=self.debug_info[-1])
@@ -99,12 +99,13 @@ class BytecodeWriter:
 
 
 @contextmanager
-def write_bytecode(num_functions: int, buf: bytearray) -> Iterator[BytecodeWriter]:
-    _write_header(buf)
+def write_bytecode(num_functions: int, buf: bytearray,
+                   version: BytecodeVersion) -> Iterator[BytecodeWriter]:
+    _write_header(buf, version)
 
     with _section(_Section.Func, 8, buf) as section_buf:
         encode_varint(num_functions, section_buf)
-        w = BytecodeWriter(section_buf)
+        w = BytecodeWriter(section_buf, version)
         yield w
         assert w._num_functions == num_functions
 
@@ -124,12 +125,11 @@ def write_bytecode(num_functions: int, buf: bytearray) -> Iterator[BytecodeWrite
     buf.append(_Section.EndOfBytecode._value_)
 
 
-def _write_header(buf: bytearray):
+def _write_header(buf: bytearray, version: BytecodeVersion):
     buf.extend(b"\x7fTileIR\x00")  # magic number
-    major, minor, tag = _BYTECODE_VERSION
-    buf.append(major)
-    buf.append(minor)
-    buf.extend(tag.to_bytes(2, "little"))
+    buf.append(version.major())
+    buf.append(version.minor())
+    buf.extend(version.tag().to_bytes(2, "little"))
 
 
 class _Section(enum.IntEnum):
