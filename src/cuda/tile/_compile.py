@@ -249,7 +249,8 @@ def compile_tile(pyfunc,
         except TileCompilerError as e:
             if context.config.enable_crash_dump:
                 _compiler_crash_dump(func_ir, bytecode_generator, e.message,
-                                     e.compiler_flags, e.compiler_version)
+                                     e.compiler_flags, e.compiler_version,
+                                     bytecode_version)
 
             raise e
 
