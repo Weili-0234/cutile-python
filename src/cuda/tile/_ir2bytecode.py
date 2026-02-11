@@ -196,10 +196,11 @@ def encode_comparison(builder: bc.CodeBuilder, fn: str, lhs: bc.Value, rhs: bc.V
         case "lt": pred = bc.ComparisonPredicate.LESS_THAN
 
     if datatype.is_float(dtype):
+        order = bc.ComparisonOrdering.UNORDERED if fn == 'ne' else bc.ComparisonOrdering.ORDERED
         return bc.encode_CmpFOp(builder,
                                 result_type=result_typeid,
                                 comparison_predicate=pred,
-                                comparison_ordering=bc.ComparisonOrdering.ORDERED,
+                                comparison_ordering=order,
                                 lhs=lhs, rhs=rhs)
     elif datatype.is_integral(dtype) or datatype.is_boolean(dtype):
         return bc.encode_CmpIOp(builder,

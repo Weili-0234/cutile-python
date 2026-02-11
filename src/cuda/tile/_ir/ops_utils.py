@@ -5,7 +5,7 @@ import itertools
 import math
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, Any, Sequence
+from typing import Optional, Tuple, Dict, Any, Sequence, Literal
 from enum import Enum
 
 from cuda.tile import _datatype as datatype
@@ -77,6 +77,17 @@ for name in ['add', 'sub', 'mul', 'truediv', 'floordiv', 'mod', 'pow',
     BINOP_REGISTRY["i" + name] = BINOP_REGISTRY[name]
 
 
+def _invert(x: int | bool, bool_action: Literal['raise'] | Literal['not']):
+    if isinstance(x, bool):
+        if bool_action == 'not':
+            return not x
+        else:
+            assert bool_action == 'raise'
+            raise TileTypeError(
+                '`~` on boolean constant is not supported, please use ct.bitwise_not')
+    return ~x
+
+
 UNARYOP_REGISTRY = {
     "abs": MathOpDef(abs),
     "neg": MathOpDef(lambda x: -x),
@@ -92,10 +103,12 @@ UNARYOP_REGISTRY = {
     "log2": MathOpDef(math.log2),
     "sqrt": MathOpDef(math.sqrt, _RD_SQRT, support_flush_to_zero=True),
     "rsqrt": MathOpDef(lambda x: x ** -0.5, support_flush_to_zero=True),
-    "invert": MathOpDef(lambda x: ~x),
+    "invert": MathOpDef(lambda x: _invert(x, bool_action='raise')),
+    "bitwise_not": MathOpDef(lambda x: _invert(x, bool_action='not')),
     "not_": MathOpDef(lambda x: not x),
     "floor": MathOpDef(math.floor),
     "ceil": MathOpDef(math.ceil),
+    "isnan": MathOpDef(math.isnan)
 }
 
 

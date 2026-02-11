@@ -1415,7 +1415,7 @@ class Unary(TypedOperation):
                                                          flush_to_zero=flush_to_zero)
             case "floor", True: return bc.encode_FloorOp(ctx.builder, res_type_id, x)
             case "ceil", True: return bc.encode_CeilOp(ctx.builder, res_type_id, x)
-            case "invert", False:
+            case "invert" | "bitwise_not", False:
                 # ~tx == tx ^ ~0
                 all_ones = (-1 if datatype.is_signed(input_dtype)
                             else ~(-1 << input_dtype.bitwidth))
@@ -1479,6 +1479,7 @@ def unary(fn: str, behavior: _UnaryBehavior, x: Var,
         return strictly_typed_const(res, ty)
 
     check_rd_and_ftz(fn, rounding_mode, flush_to_zero, get_dtype(ty))
+
     return add_operation(Unary, ty, fn=fn, operand=x,
                          rounding_mode=rounding_mode, flush_to_zero=flush_to_zero)
 
@@ -1526,7 +1527,7 @@ def pos_impl(x: Var):
 @impl(ct.cos, fixed_args=["cos", _UNARY_FLOAT])
 @impl(ct.cosh, fixed_args=["cosh", _UNARY_FLOAT])
 @impl(ct.exp, fixed_args=["exp", _UNARY_FLOAT])
-@impl(ct.bitwise_not, fixed_args=["invert", _UNARY_BOOL_INT])
+@impl(ct.bitwise_not, fixed_args=["bitwise_not", _UNARY_BOOL_INT])
 @impl(ct.floor, fixed_args=["floor", _UNARY_STRICT_FLOAT])
 @impl(ct.ceil, fixed_args=["ceil", _UNARY_STRICT_FLOAT])
 @impl(ct.negative, fixed_args=["neg", _UNARY_INT_FLOAT])
@@ -1557,6 +1558,23 @@ def unary_impl_with_rd_and_ftz(fn: str, behavior: _UnaryBehavior,
 def unary_impl_with_rd(fn: str, behavior: _UnaryBehavior, x: Var, rounding_mode: Var) -> Var:
     rounding_mode = require_optional_constant_enum(rounding_mode, RoundingMode)
     return unary(fn, behavior, x, rounding_mode=rounding_mode)
+
+
+@impl(ct.isnan)
+def isnan_impl(x: Var) -> Var:
+    x_type = require_tile_maybe_loose_type(x)
+    if isinstance(x_type, LooselyTypedScalar):
+        res = math.isnan(x_type.value)
+        return loosely_typed_const(res)
+
+    ty = x.get_type()
+    if isinstance(x_type, TileTy) and (is_float(ty.dtype) or is_restricted_float(ty.dtype)):
+        if x.is_constant():
+            res = math.isnan(x.get_constant())
+            return strictly_typed_const(res, make_tile_ty(datatype.bool_, ty.shape))
+        else:
+            return raw_comparison("ne", x, x)
+    raise TileTypeError(f"Unexpected input type {x_type}")
 
 
 @impl(getattr)

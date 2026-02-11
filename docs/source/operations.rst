@@ -119,6 +119,7 @@ Math
    maximum
    negative
    abs
+   isnan
 
    exp
    exp2

@@ -98,7 +98,8 @@ async def _dispatch_hir_block_inner(block: hir.Block, builder: ir.Builder):
             hir_lines.append(block.jump_str())
             hir_str = "\n".join("{}{}".format("--> " if i == cursor else "    ", c)
                                 for i, c in enumerate(hir_lines))
-            print(f"==== HIR for ^{block.name}({hir_params}) ====\n{hir_str}\n", file=sys.stderr)
+            print(f"==== HIR for ^{block.block_id}({hir_params}) ====\n{hir_str}\n",
+                  file=sys.stderr)
         raise
 
 

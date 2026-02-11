@@ -279,6 +279,25 @@ def test_array_compare(shape, tile, dtype, op_symbol, op_func, tmp_path):
         assert_equal(z, ref)
 
 
+# TODO: add float8_e4m3fn when tileir supports comparison on fp8 types
+@pytest.mark.parametrize('dtype', [ct.float16, ct.float32])
+def test_nan_comp(dtype):
+
+    def _check_nan(tx):
+        ct.assert_(ct.bitwise_not(tx == tx))
+        ct.assert_(tx != tx)
+        ct.assert_(ct.isnan(tx))
+
+    @ct.kernel
+    def test_nan():
+        tx = ct.full((2,), float('nan'), dtype=dtype)
+        _check_nan(tx)  # tile
+        _check_nan(ct.float32(float('nan')))  # typed scalar
+        _check_nan(float('nan'))  # loosely typed scalar
+
+    ct.launch(torch.cuda.current_stream(), (1,), test_nan, ())
+
+
 def make_is_operator_kernel(cmp):
     @ct.kernel
     def is_operator(x):

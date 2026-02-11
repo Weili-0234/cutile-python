@@ -1904,6 +1904,12 @@ def negative(x, /) -> TileOrScalar:
     """
 
 
+@_doc_unary_op
+@function
+def isnan(x, /) -> TileOrScalar:
+    pass
+
+
 # ======== Select ==============
 
 @function
