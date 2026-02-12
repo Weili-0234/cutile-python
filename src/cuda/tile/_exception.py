@@ -99,7 +99,7 @@ def _format_location_frame(loc: Loc) -> str:
 
     visual_col = _wcwidth(line_bytes[:loc.col].decode())
     if end_col == loc.col + 1:
-        end_visual_col = visual_col
+        end_visual_col = visual_col + 1
         cols_str = f"col {visual_col + 1}"
     else:
         end_visual_col = _wcwidth(line_bytes[:end_col].decode())

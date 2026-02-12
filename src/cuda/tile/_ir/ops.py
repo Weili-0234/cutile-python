@@ -1341,6 +1341,22 @@ def build_tuple(items: tuple[Var, ...]) -> Var:
     return res
 
 
+@impl(hir.unpack)
+def unpack_impl(iterable: Var, expected_len: Var) -> Var:
+    ty = iterable.get_type()
+    # Don't use the require_tuple_type() helper because we'd like to customize the error message
+    if not isinstance(ty, TupleTy):
+        raise TileTypeError("Expected a tuple", iterable.loc)
+    expected_len = require_constant_int(expected_len)
+    if len(ty.value_types) != expected_len:
+        few_many = "few" if len(ty.value_types) < expected_len else "many"
+        raise TileValueError(f"Too {few_many} values to unpack"
+                             f" (expected {expected_len}, got {len(ty.value_types)})")
+    # Return the input tuple. If we add support for additional iterables,
+    # the idea is to cast them to a tuple here.
+    return iterable
+
+
 class Unary(TypedOperation):
     def __init__(self, fn: str, operand: Var,
                  rounding_mode: Optional[RoundingMode], flush_to_zero: bool,

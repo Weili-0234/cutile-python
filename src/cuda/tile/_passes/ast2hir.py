@@ -409,13 +409,11 @@ def _do_assign(value: hir.Operand, target, ctx: _Context):
     with ctx.change_loc(target):
         if isinstance(target, ast.Name):
             ctx.store(target.id, value)
-        elif isinstance(target, ast.Tuple):
+        elif isinstance(target, ast.Tuple | ast.List):
+            value = ctx.call(hir.unpack, (value, len(target.elts)))
             for i, el in enumerate(target.elts):
-                with ctx.change_loc(el):
-                    if not isinstance(el, ast.Name):
-                        raise ctx.unsupported_syntax()
-                    item_var = ctx.call(operator.getitem, (value, i), )
-                    ctx.store(el.id, item_var)
+                item_var = ctx.call(operator.getitem, (value, i), )
+                _do_assign(item_var, el, ctx)
         else:
             raise ctx.unsupported_syntax()
 

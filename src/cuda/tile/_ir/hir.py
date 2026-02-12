@@ -221,6 +221,7 @@ class _OperandFormatter:
 def if_else(cond, then_block, else_block, /): ...
 def loop(body, iterable, /): ...  # infinite if `iterable` is None
 def build_tuple(*items): ...  # Makes a tuple (i.e. returns `items`)
+def unpack(iterable, expected_len, /): ...
 def identity(x): ...   # Identity function (i.e. returns `x`)
 def store_var(name, value, /): ...  # Store into a named variable
 def load_var(name, /): ...  # Load from a named variable
