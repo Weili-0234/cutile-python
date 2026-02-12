@@ -132,18 +132,7 @@ Scalar = int | float | ScalarProtocol
 
 
 class Array:
-    """A *global array* (or *array*) is a container of objects stored in a logical
-    multidimensional space.
-
-    |Global arrays| are always stored in memory.
-    Copying an |array| does not copy the underlying data.
-
-    |Global arrays| can be used in |host code| and |tile code|.
-    They can be |kernel| parameters.
-
-    Any object that implements the |DLPack| format or the |CUDA Array Interface| can be used
-    as a |global array|. Example: |CuPy| arrays and |PyTorch| tensors.
-    """
+    """Type stub for |array| objects."""
 
     @property
     @function
@@ -215,18 +204,7 @@ class Array:
 
 
 class Tile:
-    """A *tile array* (or *tile*) is an immutable multidimensional collection of values that is
-    local to a |block|.
-
-    The contents of a |tile| do not necessarily have a representation in memory.
-    |Tiles| can be created by loading from |global arrays| or with |factory| functions.
-    |Tiles| can also be stored into |global arrays|.
-
-    |Tiles| shall not be used in |host code|; they can only be used in |tile code|.
-    |Tiles| shall not be |kernel| parameters.
-
-    Each dimension of a |tile| shall be a power of 2.
-    """
+    """Type stub for a |tile|."""
 
     @property
     @function
@@ -257,11 +235,10 @@ class Tile:
 
     @function
     def item(self) -> "Tile":
-        """Extract scalar (0D Tile) from a single element tile.
-        Tile must contain only 1 element.
+        """Equivalent to self.reshape(()).
 
         Returns:
-            Tile: A 0D Tile usable as a scalar.
+            Tile: A scalar tile.
 
         Examples:
 
@@ -1535,6 +1512,30 @@ def pow(x, y, /) -> TileOrScalar:
     pass
 
 
+@function
+def atan2(x1, x2, /) -> TileOrScalar:
+    """Elementwise atan2 of two tiles.
+
+    Computes the element-wise arc tangent of ``x1/x2`` choosing the quadrant correctly.
+
+    Args:
+        x1 (Tile): Numerator tile (y-coordinate).
+        x2 (Tile): Denominator tile (x-coordinate).
+
+    The `shape` of `x1` and `x2` will be broadcasted and
+    `dtype` promoted to common dtype.
+
+    Returns:
+        Tile: The angles in radians, in the range [-pi, pi].
+
+    Examples:
+
+        >>> tx = ct.full((2, 4), 1.0, dtype=ct.float32)
+        >>> ty = ct.full((2, 4), 1.0, dtype=ct.float32)
+        >>> tz = ct.atan2(ty, tx)  # Result is pi/4
+    """
+
+
 @_doc_binary_op('%')
 @function
 def mod(x, y, /) -> TileOrScalar:
@@ -1813,10 +1814,27 @@ def cosh(x, /) -> TileOrScalar:
     pass
 
 
-@_doc_unary_op
 @function
-def tanh(x, /) -> TileOrScalar:
-    pass
+def tanh(x, /, *, rounding_mode: Optional[RoundingMode] = None) -> TileOrScalar:
+    """
+    Perform `tanh` on a tile.
+
+    Args:
+        x (Tile):
+        rounding_mode (RoundingMode): Supported values:
+
+            - ``RoundingMode.FULL``
+            - ``RoundingMode.APPROX`` (since CTK 13.2)
+
+    Returns:
+        Tile:
+
+    Examples:
+
+        >>> tx = ct.full((32, 32), 3.0, dtype=ct.float32)
+        >>> tx = ct.tanh(tx)
+        >>> tx = ct.tanh(tx, rounding_mode=RoundingMode.APPROX)  # Faster approximation
+    """
 
 
 @_doc_unary_op

@@ -46,6 +46,7 @@ from cuda.tile._debug import (
 )
 
 from cuda.tile._passes.alias_analysis import alias_analysis_pass
+from cuda.tile._passes.check_ampere_fp8 import check_ampere_fp8
 from cuda.tile._passes.dce import dead_code_elimination_pass
 from cuda.tile._passes.token_order import token_order_pass
 from cuda.tile._ir2bytecode import generate_bytecode_for_kernel
@@ -78,10 +79,11 @@ def global_compiler_lock(func):
 
 def _get_final_ir(pyfunc,
                   args: Sequence[ir.KernelArgument],
-                  config: TileContextConfig) -> ir.Function:
+                  config: TileContextConfig,
+                  tileiras_version: BytecodeVersion = BytecodeVersion.V_13_1) -> ir.Function:
     func_hir: hir.Function = get_function_hir(pyfunc, entry_point=True)
 
-    ir_ctx = ir.IRContext(config)
+    ir_ctx = ir.IRContext(config, tileiras_version)
     func_body = hir2ir(func_hir, args, ir_ctx)
     eliminate_assign_ops(func_body)
     dead_code_elimination_pass(func_body)
@@ -187,7 +189,7 @@ def compile_tile(pyfunc,
 
     param_names = tuple(inspect.signature(pyfunc).parameters.keys())
     ir_args = _bind_kernel_arguments(param_names, args, get_constant_annotations(pyfunc))
-    func_ir = _get_final_ir(pyfunc, ir_args, context.config)
+    func_ir = _get_final_ir(pyfunc, ir_args, context.config, bytecode_version)
 
     if 'CUTILEIR' in context.config.log_keys:
         code = (f"==== CuTile IR for {func_ir.name}==== \n\n"
@@ -195,6 +197,7 @@ def compile_tile(pyfunc,
         print(f'\n{code}', file=sys.stderr)
 
     sm_arch = get_sm_arch()
+    check_ampere_fp8(func_ir.body, sm_arch)
 
     bytecode_generator = functools.partial(generate_bytecode_for_kernel,
                                            func_ir, compiler_options, sm_arch)
@@ -246,7 +249,8 @@ def compile_tile(pyfunc,
         except TileCompilerError as e:
             if context.config.enable_crash_dump:
                 _compiler_crash_dump(func_ir, bytecode_generator, e.message,
-                                     e.compiler_flags, e.compiler_version)
+                                     e.compiler_flags, e.compiler_version,
+                                     bytecode_version)
 
             raise e
 

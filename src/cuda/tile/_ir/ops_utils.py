@@ -4,17 +4,19 @@
 import itertools
 import math
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any, Sequence
 from enum import Enum
+
 from cuda.tile import _datatype as datatype
 
+from cuda.tile._bytecode.version import BytecodeVersion
 from cuda.tile._numeric_semantics import RoundingMode, PaddingMode
-from cuda.tile._exception import Loc, TileTypeError, TileValueError
+from cuda.tile._exception import Loc, TileTypeError, TileValueError, TileUnsupportedFeatureError
 from cuda.tile._memory_model import MemoryOrder, MemoryScope
 import cuda.tile._bytecode as bc
 
-from .ir import Operation
+from .ir import Operation, Builder
 from .type import TileTy, PointerTy, LooselyTypedScalar, make_tile_ty
 from .typing_support import typeof_pyval
 from .._datatype import DType, _DTypePromotionImpl, NumericDTypeCategory, NumericDTypeCategories, \
@@ -33,30 +35,29 @@ class ComparisonPredicates(Enum):
 @dataclass
 class MathOpDef:
     impl: callable    # Python scalar fallback
-    supported_rounding_modes: Tuple[RoundingMode, ...] = ()
+    supported_rounding_modes: Dict[RoundingMode, Optional[BytecodeVersion]] = field(
+        default_factory=dict)
     support_flush_to_zero: bool = False
 
 
+_RD_BASIC = {RoundingMode.RN: None, RoundingMode.RZ: None,
+             RoundingMode.RM: None, RoundingMode.RP: None}
+_RD_TRUEDIV = {**_RD_BASIC, RoundingMode.FULL: None, RoundingMode.APPROX: None}
+_RD_SQRT = {**_RD_BASIC, RoundingMode.APPROX: None}
+_RD_TANH = {RoundingMode.FULL: None, RoundingMode.APPROX: BytecodeVersion.V_13_2}
+
 BINOP_REGISTRY = {
-    "add": MathOpDef(lambda x, y: x + y,
-                     (RoundingMode.RN, RoundingMode.RZ, RoundingMode.RM, RoundingMode.RP),
-                     support_flush_to_zero=True),
-    "sub": MathOpDef(lambda x, y: x - y,
-                     (RoundingMode.RN, RoundingMode.RZ, RoundingMode.RM, RoundingMode.RP),
-                     support_flush_to_zero=True),
-    "mul": MathOpDef(lambda x, y: x * y,
-                     (RoundingMode.RN, RoundingMode.RZ, RoundingMode.RM, RoundingMode.RP),
-                     support_flush_to_zero=True),
+    "add": MathOpDef(lambda x, y: x + y, _RD_BASIC, support_flush_to_zero=True),
+    "sub": MathOpDef(lambda x, y: x - y, _RD_BASIC, support_flush_to_zero=True),
+    "mul": MathOpDef(lambda x, y: x * y, _RD_BASIC, support_flush_to_zero=True),
     "floordiv": MathOpDef(lambda x, y: x // y),
     "cdiv": MathOpDef(lambda x, y: (x + y - 1) // y),
-    "truediv": MathOpDef(lambda x, y: x / y,
-                         (RoundingMode.RN, RoundingMode.RZ, RoundingMode.RM, RoundingMode.RP,
-                          RoundingMode.FULL, RoundingMode.APPROX),
-                         support_flush_to_zero=True),
+    "truediv": MathOpDef(lambda x, y: x / y, _RD_TRUEDIV, support_flush_to_zero=True),
     "mod": MathOpDef(lambda x, y: x % y),
     "pow": MathOpDef(lambda x, y: x ** y),
-    "max": MathOpDef(max, (), support_flush_to_zero=True),
-    "min": MathOpDef(min, (), support_flush_to_zero=True),
+    "atan2": MathOpDef(math.atan2),
+    "max": MathOpDef(max, support_flush_to_zero=True),
+    "min": MathOpDef(min, support_flush_to_zero=True),
     "and_": MathOpDef(lambda x, y: x & y),
     "or_": MathOpDef(lambda x, y: x | y),
     "xor": MathOpDef(lambda x, y: x ^ y),
@@ -80,21 +81,17 @@ UNARYOP_REGISTRY = {
     "abs": MathOpDef(abs),
     "neg": MathOpDef(lambda x: -x),
     "exp": MathOpDef(math.exp),
-    "exp2": MathOpDef(lambda x: 2 ** x, (), support_flush_to_zero=True),
+    "exp2": MathOpDef(lambda x: 2 ** x, support_flush_to_zero=True),
     "sin": MathOpDef(math.sin),
     "sinh": MathOpDef(math.sinh),
     "cos": MathOpDef(math.cos),
     "cosh": MathOpDef(math.cosh),
     "tan": MathOpDef(math.tan),
-    # TODO: RoundingMode support dependent on bytecode version
-    "tanh": MathOpDef(math.tanh),
+    "tanh": MathOpDef(math.tanh, _RD_TANH),
     "log": MathOpDef(math.log),
     "log2": MathOpDef(math.log2),
-    "sqrt": MathOpDef(math.sqrt,
-                      (RoundingMode.RN, RoundingMode.RZ, RoundingMode.RM, RoundingMode.RP,
-                       RoundingMode.APPROX),
-                      support_flush_to_zero=True),
-    "rsqrt": MathOpDef(lambda x: x ** -0.5, (), support_flush_to_zero=True),
+    "sqrt": MathOpDef(math.sqrt, _RD_SQRT, support_flush_to_zero=True),
+    "rsqrt": MathOpDef(lambda x: x ** -0.5, support_flush_to_zero=True),
     "invert": MathOpDef(lambda x: ~x),
     "not_": MathOpDef(lambda x: not x),
     "floor": MathOpDef(math.floor),
@@ -102,8 +99,8 @@ UNARYOP_REGISTRY = {
 }
 
 
-def get_default_rounding_mode():
-    return RoundingMode.RN
+def get_default_rounding_mode(opname: Optional[str] = None):
+    return RoundingMode.FULL if opname == 'tanh' else RoundingMode.RN
 
 
 rounding_mode_to_bytecode = {
@@ -115,8 +112,6 @@ rounding_mode_to_bytecode = {
     RoundingMode.APPROX: bc.RoundingMode.APPROX,
     RoundingMode.RZI: bc.RoundingMode.NEAREST_INT_TO_ZERO
 }
-
-rounding_mode_to_bytecode[None] = rounding_mode_to_bytecode[get_default_rounding_mode()]
 
 
 def get_rounding_mode(op: Operation, constants: Dict[str, Any]) -> Optional[RoundingMode]:
@@ -145,6 +140,14 @@ def check_rd_and_ftz(fn: str, rounding_mode: Optional[RoundingMode], flush_to_ze
         if rounding_mode not in math_op_def.supported_rounding_modes:
             raise TileTypeError(
                 f'Rounding mode {rounding_mode.value} is not supported for {fn}')
+        min_version = math_op_def.supported_rounding_modes[rounding_mode]
+        if min_version is not None:
+            cur_version = Builder.get_current().ir_ctx.tileiras_version
+            if cur_version < min_version:
+                raise TileUnsupportedFeatureError(
+                    f'{fn} rounding_mode={rounding_mode.value} requires tileiras '
+                    f'{min_version.major()}.{min_version.minor()} or later. '
+                    f'Current version is {cur_version.major()}.{cur_version.minor()}.')
         if not datatype.is_float(dtype):
             raise TileTypeError(
                 f'Rounding mode can only be used for float types, '
@@ -186,28 +189,17 @@ def memory_order_has_release(memory_order: MemoryOrder):
     return memory_order in (MemoryOrder.RELEASE, MemoryOrder.ACQ_REL)
 
 
-def get_dtype(ty: TileTy | datatype.DType | PointerTy | LooselyTypedScalar) \
-        -> datatype.DType | PointerTy:
-    if isinstance(ty, TileTy):
-        return ty.dtype
-    elif isinstance(ty, datatype.DType):
-        return ty
-    elif isinstance(ty, PointerTy):
-        return ty
-    elif isinstance(ty, LooselyTypedScalar):
-        return typeof_pyval(ty.value)
-    else:
-        raise TypeError(f"Cannot get dtype from {ty}")
+def get_dtype(ty: TileTy | LooselyTypedScalar) -> datatype.DType | PointerTy:
+    if isinstance(ty, LooselyTypedScalar):
+        ty = typeof_pyval(ty.value)
+    assert isinstance(ty, TileTy)
+    return ty.dtype
 
 
-def change_dtype(ty: TileTy | datatype.DType | PointerTy,
-                 new_dtype: datatype.DType | PointerTy) \
-        -> TileTy | datatype.DType | PointerTy:
-    if isinstance(ty, TileTy):
-        return TileTy(new_dtype, ty.shape)
-    else:
-        assert isinstance(ty, datatype.DType | PointerTy)
-        return new_dtype
+def change_dtype(ty: TileTy, new_dtype: datatype.DType | PointerTy) \
+        -> TileTy:
+    assert isinstance(ty, TileTy)
+    return TileTy(new_dtype, ty.shape)
 
 
 def check_shapes_eq(a: TileTy, b: TileTy,
@@ -235,8 +227,9 @@ padding_mode_to_bytecode = {
 def _promote_dtype_and_loosely_typed_constant(dtype: DType,
                                               loose_const: Any,
                                               force_float: bool) -> DType:
-    loose_dtype = typeof_pyval(loose_const)
-    assert isinstance(loose_dtype, DType)
+    loose_ty = typeof_pyval(loose_const)
+    assert isinstance(loose_ty, TileTy) and loose_ty.ndim == 0
+    loose_dtype = loose_ty.dtype
 
     cat = NumericDTypeCategories.get_category(dtype)
     if cat == NumericDTypeCategory.RestrictedFloat:
@@ -265,11 +258,11 @@ def promote_dtypes(t1: DType | LooselyTypedScalar,
                    force_float: bool = False) -> DType:
     match t1, t2:
         case LooselyTypedScalar(val1), LooselyTypedScalar(val2):
-            dtype1 = typeof_pyval(val1)
-            assert isinstance(dtype1, DType)
-            dtype2 = typeof_pyval(val2)
-            assert isinstance(dtype2, DType)
-            return _DTypePromotionImpl.promote_dtypes(dtype1, dtype2, force_float)
+            type1 = typeof_pyval(val1)
+            assert isinstance(type1, TileTy)
+            type2 = typeof_pyval(val2)
+            assert isinstance(type2, TileTy)
+            return _DTypePromotionImpl.promote_dtypes(type1.dtype, type2.dtype, force_float)
         case LooselyTypedScalar(val), dtype:
             return _promote_dtype_and_loosely_typed_constant(dtype, val, force_float)
         case dtype, LooselyTypedScalar(val):
@@ -278,23 +271,14 @@ def promote_dtypes(t1: DType | LooselyTypedScalar,
             return _DTypePromotionImpl.promote_dtypes(dtype1, dtype2, force_float)
 
 
-def promote_types(t1: TileTy | DType | LooselyTypedScalar,
-                  t2: TileTy | DType | LooselyTypedScalar,
-                  force_float: bool = False) -> TileTy | DType:
-    dtype_1 = t1 if isinstance(t1, LooselyTypedScalar) else get_dtype(t1)
-    dtype_2 = t2 if isinstance(t2, LooselyTypedScalar) else get_dtype(t2)
+def promote_types(t1: TileTy | LooselyTypedScalar,
+                  t2: TileTy | LooselyTypedScalar,
+                  force_float: bool = False) -> TileTy:
+    dtype_1 = t1 if isinstance(t1, LooselyTypedScalar) else t1.dtype
+    dtype_2 = t2 if isinstance(t2, LooselyTypedScalar) else t2.dtype
     dtype = promote_dtypes(dtype_1, dtype_2, force_float)
-
-    is_tile_1 = isinstance(t1, TileTy)
-    is_tile_2 = isinstance(t2, TileTy)
-
-    if is_tile_1 or is_tile_2:
-        shape_1 = t1.shape_value if is_tile_1 else ()
-        shape_2 = t2.shape_value if is_tile_2 else ()
-        shape = broadcast_shapes2(shape_1, shape_2)
-        return make_tile_ty(dtype, shape)
-    else:
-        return dtype
+    shape = broadcast_shapes2(t1.shape_value, t2.shape_value)
+    return make_tile_ty(dtype, shape)
 
 
 def _is_implicit_cast_ok(src_dtype: DType, target_dtype: DType) -> bool:
@@ -305,10 +289,10 @@ def _is_implicit_cast_ok(src_dtype: DType, target_dtype: DType) -> bool:
     return common_dtype == target_dtype
 
 
-def check_implicit_cast(src_ty: TileTy | DType | LooselyTypedScalar, target_dtype: DType):
-    src_dtype = get_dtype(src_ty)
+def check_implicit_cast(src_ty: TileTy | LooselyTypedScalar, target_dtype: DType):
     if isinstance(src_ty, LooselyTypedScalar):
-        src_cat = NumericDTypeCategories.get_category(src_dtype)
+        cocnrete_ty = typeof_pyval(src_ty.value)
+        src_cat = NumericDTypeCategories.get_category(cocnrete_ty.dtype)
         dst_cat = NumericDTypeCategories.get_category(target_dtype)
         if dst_cat == NumericDTypeCategory.Boolean:
             if src_cat not in (NumericDTypeCategory.Boolean, NumericDTypeCategory.Integral) \
@@ -321,8 +305,9 @@ def check_implicit_cast(src_ty: TileTy | DType | LooselyTypedScalar, target_dtyp
             if not (min <= src_ty.value <= max):
                 raise TileValueError(f"{src_ty.value} is out of range of {target_dtype}")
     else:
-        if not _is_implicit_cast_ok(src_dtype, target_dtype):
-            raise TileTypeError(f"cannot implicitly cast {src_dtype} to {target_dtype}")
+        assert isinstance(src_ty, TileTy)
+        if not _is_implicit_cast_ok(src_ty.dtype, target_dtype):
+            raise TileTypeError(f"cannot implicitly cast {src_ty.dtype} to {target_dtype}")
 
 
 class BroadcastError(Exception):

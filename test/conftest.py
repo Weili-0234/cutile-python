@@ -8,6 +8,26 @@ import cuda_timer
 import subprocess
 import sys
 import math
+import tempfile
+from functools import cache
+
+from cuda.tile._bytecode.version import BytecodeVersion
+from cuda.tile._compile import _get_max_supported_bytecode_version
+
+
+@cache
+def get_tileiras_version():
+    return _get_max_supported_bytecode_version(tempfile.gettempdir())
+
+
+def requires_tileiras(version: BytecodeVersion):
+    """Skip test if tileiras version is lower than required."""
+    current = get_tileiras_version()
+    return pytest.mark.skipif(
+        current < version,
+        reason=f"Requires tileiras {version.major()}.{version.minor()}, "
+               f"found {current.major()}.{current.minor()}"
+    )
 
 
 def dtype_id(dtype):

@@ -11,7 +11,7 @@ from cuda.tile._compiler_options import CompilerOptions
 from cuda.tile._exception import TileTypeError, TileValueError
 from cuda.tile._compile import compile_tile
 
-from util import raises_if
+from util import raises_if, is_ampere_or_ada
 
 
 def nd_tensor(nd: int, dtype=None):
@@ -39,7 +39,7 @@ def test_invalid_shape_dtype():
         ct.load(x, (0, 0), shape=(2, 2.0))
 
     msg = re.escape('Invalid argument "shape" of load(): Expected a tuple of integers,'
-                    ' but element #1 has type float32')
+                    ' but element #1 has type Tile[float32,()]')
 
     with pytest.raises(TileTypeError, match=msg):
         compile(kernel, (nd_tensor(2),))
@@ -206,6 +206,7 @@ def test_arith_on_bool():
 
 
 def test_printf_format():
+    SKIP_FP8 = is_ampere_or_ada()
 
     def print_kernel():
         # signed
@@ -226,8 +227,9 @@ def test_printf_format():
         ct.printf("%f", ct.float16(3.14))
         ct.printf("%f", ct.float32(3.14))
         ct.printf("%f", ct.float64(3.14))
-        ct.printf("%f", ct.float8_e5m2(3.14))
-        ct.printf("%f", ct.float8_e4m3fn(3.14))
+        if not SKIP_FP8:
+            ct.printf("%f", ct.float8_e5m2(3.14))
+            ct.printf("%f", ct.float8_e4m3fn(3.14))
         ct.printf("%f", ct.tfloat32(3.14))
         # others
         ct.printf("escape %% %d", 123)

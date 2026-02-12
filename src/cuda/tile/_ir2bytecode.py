@@ -21,7 +21,10 @@ from cuda.tile._ir.ops_utils import (
 from cuda.tile._ir.type import Type, TileTy, PointerTy, TokenTy, TupleTy, ArrayTy, SizeTy
 
 
-def dtype_typeid(tt: bc.TypeTable, dtype: datatype.DType) -> bc.TypeId:
+def dtype_typeid(tt: bc.TypeTable, dtype: datatype.DType | PointerTy) -> bc.TypeId:
+    if isinstance(dtype, PointerTy):
+        pointee = dtype_typeid(tt, dtype.pointee_type)
+        return tt.pointer(pointee)
     return tt.simple(dtype._bytecode_type)
 
 
@@ -38,17 +41,11 @@ def tensor_view_typeid_for_list(tt: bc.TypeTable, item_size_words: int) -> bc.Ty
     return tt.tensor_view(tt.I64, shape, strides)
 
 
-def typeid(tt: bc.TypeTable, ty: Type, wrap_scalars: bool = True) -> bc.TypeId:
+def typeid(tt: bc.TypeTable, ty: Type) -> bc.TypeId:
     if isinstance(ty, TileTy):
-        dtype = typeid(tt, ty.dtype, wrap_scalars=False)
+        dtype = dtype_typeid(tt, ty.dtype)
         shape = [x.value for x in ty.shape]
         return tt.tile(dtype, shape)
-    elif isinstance(ty, datatype.DType):
-        dtype = dtype_typeid(tt, ty)
-        return tt.tile(dtype, ()) if wrap_scalars else dtype
-    elif isinstance(ty, PointerTy):
-        pointee = typeid(tt, ty.pointee_type, wrap_scalars=False)
-        return tt.pointer(pointee)
     elif isinstance(ty, TokenTy):
         return tt.Token
     else:
@@ -227,7 +224,7 @@ def lower_scan(ctx: "BytecodeContext", x: bc.Value, input_ty: Type,
         raise NotImplementedError(f"Unsupported scan function: {scan_fn}")
     element_dtype = get_dtype(input_ty)
     tt = ctx.type_table
-    element_type_id = typeid(tt, element_dtype, wrap_scalars=False)
+    element_type_id = dtype_typeid(tt, element_dtype)
     if use_float:
         identity_attr = bc.Float(id_val, element_dtype._bytecode_type, tt)
     else:
@@ -243,7 +240,8 @@ def lower_scan(ctx: "BytecodeContext", x: bc.Value, input_ty: Type,
 
     element_tile_typeid = tt.tile(element_type_id, ())
     with nested_builder.new_block((element_tile_typeid, element_tile_typeid)) as (a, b):
-        rounding_mode_bc = rounding_mode_to_bytecode[rounding_mode]
+        rm = rounding_mode if rounding_mode is not None else get_default_rounding_mode()
+        rounding_mode_bc = rounding_mode_to_bytecode[rm]
         match scan_fn, use_float:
             case "add", True:
                 res = bc.encode_AddFOp(ctx.builder, element_tile_typeid, a, b,
@@ -374,12 +372,10 @@ class BytecodeContext:
         self._value_map[name] = value
 
     def cast(self, val: bc.Value, fromty: Type, toty: Type) -> bc.Value:
+        assert isinstance(fromty, TileTy)
+        assert isinstance(toty, TileTy)
         if fromty == toty:
             return val
-        if isinstance(fromty, datatype.DType):
-            fromty = TileTy(fromty, TupleTy([]))
-        if isinstance(toty, datatype.DType):
-            toty = TileTy(toty, TupleTy([]))
         if fromty.shape != toty.shape:
             val, fromty = _broadcast_shape(self, val, fromty, toty)
         if fromty.dtype != toty.dtype:
@@ -387,12 +383,10 @@ class BytecodeContext:
         return val
 
     def bitcast(self, value: bc.Value, fromty: Type, toty: Type) -> bc.Value:
+        assert isinstance(fromty, TileTy)
+        assert isinstance(toty, TileTy)
         if fromty == toty:
             return value
-        if isinstance(fromty, datatype.DType):
-            fromty = TileTy(fromty, TupleTy([]))
-        if isinstance(toty, datatype.DType):
-            toty = TileTy(toty, TupleTy([]))
         if fromty.shape != toty.shape:
             value, fromty = _broadcast_shape(self, value, fromty, toty)
         if fromty.dtype != toty.dtype:
@@ -402,8 +396,6 @@ class BytecodeContext:
     def constant(self, value: int | float, ty: Type) -> bc.Value:
         if isinstance(ty, TileTy):
             dtype = ty.dtype
-        elif isinstance(ty, datatype.DType):
-            dtype = ty
         else:
             raise TypeError(f"Cannot make a constant tuple out of {ty}")
 

@@ -13,7 +13,8 @@ from util import (
     launch_binary, assert_equal, assert_close, jit_kernel, filecheck,
     get_bytecode, raises_if
 )
-from conftest import float_dtypes, int_dtypes, bool_dtypes, dtype_id
+from conftest import float_dtypes, int_dtypes, bool_dtypes, dtype_id, requires_tileiras
+from cuda.tile._bytecode.version import BytecodeVersion
 from cuda.tile._exception import TileTypeError
 from cuda.tile._ir.typing_support import to_dtype
 from cuda.tile._numeric_semantics import RoundingMode as RMd
@@ -816,3 +817,21 @@ def test_array_scalar_implicit_cast_unhappy(tmp_path):
     kernel = array_scalar_kernel('inplace_bin', 'tx *= 3.0; tz = tx', tmp_path)
     with pytest.raises(TileTypeError):
         launch_binary(kernel, x, x, z, 1)
+
+
+@requires_tileiras(BytecodeVersion.V_13_2)
+@pytest.mark.parametrize("x_dtype", float_dtypes, ids=dtype_id)
+@pytest.mark.parametrize("y_dtype", float_dtypes, ids=dtype_id)
+def test_array_atan2(shape, tile, x_dtype, y_dtype, tmp_path):
+    should_raise = {x_dtype, y_dtype} == {torch.float16, torch.bfloat16}
+    x = make_tensor(shape, dtype=x_dtype, device='cuda')
+    y = make_tensor(shape, dtype=y_dtype, device='cuda')
+    z = torch.zeros_like(x).to(torch.promote_types(x_dtype, y_dtype))
+    kernel = array_kernel('atan2', "tz = ct.atan2(tx, ty)", tmp_path)
+    if should_raise:
+        with pytest.raises(TileTypeError,
+                           match=r"Implicit promotion of .* and .* is not supported"):
+            launch_binary(kernel, x, y, z, tile)
+    else:
+        launch_binary(kernel, x, y, z, tile)
+        assert_close(z, torch.atan2(x, y))

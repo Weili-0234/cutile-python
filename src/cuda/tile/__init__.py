@@ -47,6 +47,7 @@ from cuda.tile._exception import (
     TileRecursionError,
     TileSyntaxError,
     TileTypeError,
+    TileUnsupportedFeatureError,
     TileValueError,
 )
 
@@ -64,6 +65,7 @@ from cuda.tile._stub import (
     argmin,
     assert_,
     astype,
+    atan2,
     atomic_add,
     atomic_and,
     atomic_cas,
@@ -181,6 +183,7 @@ __all__ = [
     "TileRecursionError",
     "TileSyntaxError",
     "TileTypeError",
+    "TileUnsupportedFeatureError",
     "TileValueError",
 
     "Array",
@@ -196,6 +199,7 @@ __all__ = [
     "argmin",
     "assert_",
     "astype",
+    "atan2",
     "atomic_add",
     "atomic_and",
     "atomic_cas",

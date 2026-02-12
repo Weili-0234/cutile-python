@@ -22,23 +22,24 @@ from cuda.tile._exception import (
     TileTypeError, Loc, TileInternalError
 )
 from .. import TileSyntaxError
-from .._cext import TileContext
 from .._context import TileContextConfig
+from cuda.tile._bytecode.version import BytecodeVersion
 
 if TYPE_CHECKING:
     from cuda.tile._ir2bytecode import BytecodeContext
 
 
 class IRContext:
-    def __init__(self, config: TileContextConfig):
+    def __init__(self, config: TileContextConfig, tileiras_version: BytecodeVersion):
         self._all_vars: Dict[str, str] = {}
         self._counter_by_name: Dict[str, Iterator[int]] = defaultdict(itertools.count)
         self._temp_counter = itertools.count()
         self.typemap: Dict[str, Type] = dict()
         self.constants: Dict[str, Any] = dict()
         self._loose_typemap: Dict[str, Type] = dict()
-        self.config: TileContext = config
+        self.config: TileContextConfig = config
         self._aggregate_values: Dict[str, Any] = dict()
+        self.tileiras_version: BytecodeVersion = tileiras_version
 
     #  Make a Var with a unique name based on `name`.
     def make_var(self, name: str, loc: Loc, undefined: bool = False) -> Var:
@@ -179,6 +180,7 @@ class Var:
             raise TileInternalError(f"Type of variable {self.name} not found")
 
     def set_type(self, ty: Type, force: bool = False):
+        assert isinstance(ty, Type)
         if not force:
             assert self.name not in self.ctx.typemap
         self.ctx.typemap[self.name] = ty
@@ -207,6 +209,7 @@ class Var:
         return self.get_type_allow_invalid() if ty is None else ty
 
     def set_loose_type(self, ty: Type, force: bool = False):
+        assert isinstance(ty, Type)
         if not force:
             assert self.name not in self.ctx._loose_typemap
         self.ctx._loose_typemap[self.name] = ty
