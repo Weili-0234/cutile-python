@@ -51,6 +51,7 @@ from cuda.tile._passes.alias_analysis import alias_analysis_pass
 from cuda.tile._passes.check_ampere_fp8 import check_ampere_fp8
 from cuda.tile._passes.dce import dead_code_elimination_pass
 from cuda.tile._passes.token_order import token_order_pass
+from cuda.tile._cache import cache_key, cache_lookup, cache_store, evict_lru
 from cuda.tile._ir2bytecode import generate_bytecode_for_kernel
 from cuda.tile._version import __version__ as cutile_version
 import cuda.tile._bytecode as bc
@@ -248,6 +249,21 @@ def compile_tile(pyfunc,
             print("Can't print MLIR because the internal extension is missing. "
                   "This is currently not a public feature.", file=sys.stderr)
 
+    # Check disk cache before invoking tileiras
+    cache_dir = context.config.cache_dir
+    compiler_ver = _get_compiler_version_string()
+    key = None
+    if cache_dir is None:
+        logger.debug("disk cache disabled: context.config.cache_dir is not set")
+    elif compiler_ver is None:
+        logger.warning("disk cache disabled: compiler version is unknown")
+    else:
+        opt_level = compiler_options.specialize_for_target(sm_arch).opt_level
+        key = cache_key(compiler_ver, sm_arch, opt_level, bytecode_buf)
+        cubin_path = cache_lookup(cache_dir, key, context.config.temp_dir)
+        if cubin_path is not None:
+            return TileLibrary(func_ir.name, cubin_path, bytecode_buf, func_ir.body)
+
     # Compile MLIR module and generate cubin
     with tempfile.NamedTemporaryFile(suffix='.bytecode', prefix=func_ir.name,
                                      dir=context.config.temp_dir, delete=False) as f:
@@ -264,6 +280,10 @@ def compile_tile(pyfunc,
                                      bytecode_version)
 
             raise e
+
+    if cache_dir is not None and key is not None:
+        cache_store(cache_dir, key, cubin_file)
+        evict_lru(cache_dir, context.config.cache_size_limit)
 
     return TileLibrary(func_ir.name, cubin_file, bytecode_buf, func_ir.body)
 
@@ -434,6 +454,13 @@ def _try_get_compiler_version(compiler_bin) -> Optional[str]:
         return res.stdout
     except Exception:
         return None
+
+
+@cache
+def _get_compiler_version_string() -> str | None:
+    binary = _find_compiler_bin()
+    version = _try_get_compiler_version(binary.path)
+    return version
 
 
 @cache

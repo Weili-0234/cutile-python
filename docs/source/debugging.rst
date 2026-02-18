@@ -39,3 +39,15 @@ debugging :class:`TileTypeError`.
 
 Set ``CUDA_TILE_TEMP_DIR`` to configure the directory
 for storing temporary files.
+
+Set ``CUDA_TILE_CACHE_DIR`` to configure the directory
+for the bytecode-to-cubin disk cache. Compiled cubins
+are cached here to avoid recompilation of unchanged
+kernels. Set to ``0``, ``off``, ``none``, or an empty
+string to disable caching. Defaults to
+``~/.cache/cutile-python``.
+
+Set ``CUDA_TILE_CACHE_SIZE`` to configure the maximum
+disk cache size in bytes. Oldest entries are evicted
+when the cache exceeds this limit. Defaults to
+2 GB (2147483648).
