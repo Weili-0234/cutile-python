@@ -929,8 +929,8 @@ def _ast2hir(func_def: ast.FunctionDef | ast.Lambda, ctx: _Context) -> hir.Block
         elif isinstance(func_def, ast.FunctionDef):
             # To enable early returns in a helper function, wrap the body in a loop.
             # Thus, we can use "break" to implement the return statement.
-            ctx.store("$returning", False)
             with ctx.new_block() as body_block:
+                ctx.store("$returning", False)
                 _stmt_list(func_def.body, ctx)
                 if body_block.jump is None:
                     ctx.store("$retval", None)
