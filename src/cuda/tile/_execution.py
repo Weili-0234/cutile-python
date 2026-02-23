@@ -12,6 +12,8 @@ from cuda.tile._cext import TileDispatcher
 
 __all__ = ("function", "kernel")
 
+from cuda.tile._dispatch_mode import DispatchMode
+
 
 ###############################################################################
 # Decorators
@@ -42,7 +44,8 @@ def function(func=None, /, *, host=False, tile=True):
         else:
             @functools.wraps(func)
             def wrapped(*args, **kwargs):
-                raise RuntimeError('Tile functions can only be called from tile code.')
+                return DispatchMode.get_current().call_tile_function_from_host(
+                        wrapped, args, kwargs)
             return wrapped
 
     if func is None:

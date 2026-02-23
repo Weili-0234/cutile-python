@@ -170,7 +170,6 @@ class Array:
             int (constant):
         """
 
-    @function
     def slice(self, axis, start, stop) -> "Array":
         """Creates a view of the |array| sliced along a single `axis`.
 
@@ -201,6 +200,7 @@ class Array:
             >>> segment = A.slice(axis=1, start=offset, stop=offset + length)
             >>> tile = ct.load(segment, (0, 0), shape=(TILE_M, TILE_N))
         """
+        return _m_array_slice(self, axis, start, stop)
 
 
 class Tile:
@@ -233,7 +233,6 @@ class Tile:
             int (constant):
         """
 
-    @function
     def item(self) -> "Tile":
         """Equivalent to self.reshape(()).
 
@@ -246,138 +245,125 @@ class Tile:
             >>> x = tx.item()
             >>> ty = ct.load(array, (0, x), shape=(4, 4))
         """
+        return _m_tile_item(self)
 
-    @function
     def extract(self, index, shape):
         """See :py:func:`extract`."""
+        return extract(self, index, shape)
 
-    @function
     def reshape(self, shape) -> "Tile":
         """See :py:func:`reshape`."""
+        return reshape(self, shape)
 
-    @function
     def permute(self, axes) -> "Tile":
         """See :py:func:`permute`."""
+        return permute(self, axes)
 
-    @function
     def transpose(self, axis0=None, axis1=None) -> "Tile":
         """See :py:func:`transpose`."""
+        return transpose(self, axis0, axis1)
 
-    @function
     def astype(self, dtype) -> "Tile":
         """See :py:func:`astype`."""
+        return astype(self, dtype)
 
     @function
     def __index__(self) -> int:
         """0D Tile can be used as index in range"""
 
-    @function
     def __getitem__(self, index) -> "Tile":
         """Syntax sugar for expand_dim"""
+        return expand_dims(self, index)
 
-    @function
     def __add__(self, other) -> "Tile":
-        ...
+        return add(self, other)
 
-    @function
     def __sub__(self, other) -> "Tile":
-        ...
+        return sub(self, other)
 
-    @function
     def __mul__(self, other) -> "Tile":
-        ...
+        return mul(self, other)
 
-    @function
     def __truediv__(self, other) -> "Tile":
-        ...
+        return truediv(self, other)
 
-    @function
     def __floordiv__(self, other) -> "Tile":
-        ...
+        return floordiv(self, other)
 
-    @function
     def __mod__(self, other) -> "Tile":
-        ...
+        return mod(self, other)
 
-    @function
     def __pow__(self, other) -> "Tile":
-        ...
+        return pow(self, other)
 
-    @function
     def __and__(self, other) -> "Tile":
-        ...
+        return bitwise_and(self, other)
 
-    @function
     def __or__(self, other) -> "Tile":
-        ...
+        return bitwise_or(self, other)
 
-    @function
     def __xor__(self, other) -> "Tile":
-        ...
+        return bitwise_xor(self, other)
 
-    @function
     def __radd__(self, other) -> "Tile":
-        ...
+        return add(other, self)
 
-    @function
     def __rsub__(self, other) -> "Tile":
-        ...
+        return sub(other, self)
 
-    @function
     def __rmul__(self, other) -> "Tile":
-        ...
+        return mul(other, self)
 
-    @function
     def __rtruediv__(self, other) -> "Tile":
-        ...
+        return truediv(other, self)
 
-    @function
     def __rfloordiv__(self, other) -> "Tile":
-        ...
+        return floordiv(other, self)
 
-    @function
     def __rmod__(self, other) -> "Tile":
-        ...
+        return mod(other, self)
 
-    @function
     def __rpow__(self, other) -> "Tile":
-        ...
+        return pow(other, self)
 
-    @function
     def __rand__(self, other) -> "Tile":
-        ...
+        return bitwise_and(other, self)
 
-    @function
     def __ror__(self, other) -> "Tile":
-        ...
+        return bitwise_or(other, self)
 
-    @function
     def __rxor__(self, other) -> "Tile":
-        ...
+        return bitwise_xor(other, self)
 
-    @function
     def __ge__(self, other) -> "Tile":
-        ...
+        return greater_equal(self, other)
 
-    @function
     def __gt__(self, other) -> "Tile":
-        ...
+        return greater(self, other)
 
-    @function
     def __le__(self, other) -> "Tile":
-        ...
+        return less_equal(self, other)
 
-    @function
     def __lt__(self, other) -> "Tile":
-        ...
+        return less(self, other)
 
-    @function
     def __eq__(self, other) -> "Tile":
-        ...
+        return equal(self, other)
 
-    @function
     def __ne__(self, other) -> "Tile":
-        ...
+        return not_equal(self, other)
+
+    def __neg__(self) -> "Tile":
+        return negative(self)
+
+    def __invert__(self) -> "Tile":
+        return bitwise_not(self)
+
+    def __matmul__(self, other) -> "Tile":
+        return matmul(self, other)
+
+    def __rmatmul__(self, other) -> "Tile":
+        return matmul(other, self)
 
 
 Shape = Union[int, tuple[int, ...]]
@@ -1411,6 +1397,32 @@ def cumprod(x, /, axis=0, *, reverse=False, rounding_mode: Optional[RoundingMode
     pass
 
 
+@function
+def scan(x, /, axis, func, identity, *, reverse=False):
+    """
+    Apply custom scan (inclusive prefix) function along axis.
+
+    Args:
+        x: input tile or a tuple of tiles to be scanned. If a tuple is provided, shapes
+            of the tiles in the tuple must be broadcastable to a common shape.
+        axis (int): an integer constant that specifies the axis to scan along.
+        func: function for combining two values. If `x` is a single tile, then the function
+            must take two 0d tile arguments and return the combined 0d tile. For example,
+            `lambda a, b: a + b` or `operator.add` can be used to implement cumsum.
+            If `x` is a tuple of N tiles, then the function takes 2N tiles and returns a tuple
+            of N combined tiles. The first N arguments correspond to one of the groups of values
+            being combined, while the rest correspond to the other.
+        identity: a constant scalar or a tuple of constant scalars that specifies the identity
+            element of the `func`.
+        reverse (bool): if True, the scan is performed in the reverse direction along the axis.
+            Default: False.
+
+    Returns:
+        Scanned tile, or tuple of scanned tiles, depending on the type of `x`.
+    """
+    pass
+
+
 # ======== Math binary ==============
 def _doc_binary_op(builtin_op):
     def decorator(f):
@@ -1878,6 +1890,12 @@ def negative(x, /) -> TileOrScalar:
     """
 
 
+@_doc_unary_op
+@function
+def isnan(x, /) -> TileOrScalar:
+    pass
+
+
 # ======== Select ==============
 
 @function
@@ -1989,10 +2007,114 @@ def assert_(cond, /, message=None) -> None:
     """
 
 
+@function
+def static_eval(expr, /):
+    """Evaluates the given Python expression at compile time.
+
+    The expression is evaluated using standard Python semantics, not Tile
+    semantics. It can reference global variables and local variables from
+    the surrounding tile function.
+
+    If a referenced variable is a compile-time constant value, it will be represented
+    with a corresponding Python object of that value. For example, a constant integer 3 will
+    be passed as a plain ``int`` object of value 3.
+
+    If a referenced variable has dynamic value, such as a tile or an array,
+    it will be passed as a proxy object that allows querying compile-time attributes.
+    For example, if ``x`` is a tile, one can use ``x.shape`` to obtain the tile shape
+    as a tuple of integers.
+
+    The expression is allowed to return a proxy object for a dynamic value.
+    This can be used to select one of multiple dynamic values based on a compile-time
+    condition. For example, if ``N`` is an integer constant and ``x``, ``y`` are dynamic
+    tiles, then one can write ``x_or_y = ct.static_eval(x if N % 2 == 0 else y)`` to select
+    either ``x`` or ``y`` at compile tile, depending on the parity of ``N``.
+
+    However, the expression is not allowed to perform any run-time operations. For example,
+    if ``x`` refers to a dynamic tile, then ``ct.static_eval(x + 1)`` will raise an error.
+
+    The expression must not assign to local variables (e.g., via the walrus operator ``:=``).
+
+    Despite being declared as a function, `static_eval()` is treated like a keyword:
+    it skips the translation of the surrounded expression according to the Tile semantics.
+    Moreover, the expression is allowed to use the full Python syntax, unlike the rest
+    of the Tile code, which is limited to a stricter subset of the language.
+    """
+
+
+@function
+def static_assert(condition, message=None, /):
+    """Asserts that a condition is true at compile time.
+
+    First, `condition` is evaluated using the same rules as :py:func:`static_eval`:
+    it can reference global and local variables, and use the full
+    Python syntax, but must not perform any run-time operations.
+
+    The `condition` must evaluate to a compile-time constant boolean.
+    If it evaluates to ``True``, compilation continues normally,
+    and the `message` expression is not evaluated.
+
+    If `condition` evaluates to ``False``, then the `message` expression is evaluated using
+    the :py:func:`static_eval` semantics. If the result of the evaluation is None,
+    it is replaced with an empty string. Otherwise, it is converted to a string using
+    the builtin ``str()`` function. Then, a :py:class:`TileStaticAssertionError` is raised
+    with the evaluated message string.
+
+    Because `message` is evaluated using the :py:func:`static_eval` semantics,
+    it can include useful debug information about local variables, for example:
+
+        >>> x = ct.ones((4,), dtype=ct.int32)
+        >>> y = ct.ones((4,), dtype=ct.float32)
+        >>> ct.static_assert(x.dtype == y.dtype,
+        >>>                  f"Expected {x} and {y} to have same dtype.")
+        Static assertion failed: Expected <tile[int32, (4,)]> and <tile[float32, (4,)]>
+         to have same dtype.
+
+    Since the message is automatically converted to a string, one can use any object
+    in its place, for example:
+
+        >>> ct.static_assert(x.dtype == ct.float32, x)
+        Static assertion failed: <tile[int32, (4,)]>
+
+    Despite being declared as a function, `static_assert()` is treated like a keyword:
+    it skips the translation of the surrounded expressions according to the Tile semantics.
+    Moreover, the expressions are allowed to use the full Python syntax, unlike the rest
+    of the Tile code, which is limited to a stricter subset of the language.
+    """
+
+
+@function
+def static_iter(iterable):
+    """Iterates at compile time.
+
+    Can only be used as the iterable of a `for` loop::
+
+        for ... in ct.static_iter(...):
+            ...
+
+    The surrounded expression is evaluated using the same rules as :py:func:`static_eval`:
+    it can reference global and local variables, and use the full Python syntax,
+    but must not perform any run-time operations.
+
+    The expression must return a Python iterable, whose length must not exceed some
+    pre-defined number of iterations (currently, 1000). Before any further processing is done,
+    the contents of the iterable are saved to a temporary list, and each item is checked
+    to be valid, as if it were a result of a :py:func:`static_eval` expression
+    (i.e., it must be a supported compile-time constant value or a proxy object
+    for a dynamic value such as a tile).
+
+    Finally, for each item of the iterable, the loop body is inlined, with the induction variable(s)
+    bound to the item. The `break`, `continue`, and `return` statements are not allowed
+    inside a `static_iter` loop.
+    """
+
+
 # ==== Private stubs ====
 
 
-def _m_array_slice(array, axis, start, stop): ...  # Array.slice(axis, start, stop)
+@function
+def _m_array_slice(array, axis, start, stop) -> Array: ...  # Array.slice(axis, start, stop)
 
 
+@function
 def _m_tile_item(tile): ...  # Tile.item()

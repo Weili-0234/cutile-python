@@ -98,7 +98,8 @@ async def _dispatch_hir_block_inner(block: hir.Block, builder: ir.Builder):
             hir_lines.append(block.jump_str())
             hir_str = "\n".join("{}{}".format("--> " if i == cursor else "    ", c)
                                 for i, c in enumerate(hir_lines))
-            print(f"==== HIR for ^{block.name}({hir_params}) ====\n{hir_str}\n", file=sys.stderr)
+            print(f"==== HIR for ^{block.block_id}({hir_params}) ====\n{hir_str}\n",
+                  file=sys.stderr)
         raise
 
 
@@ -303,10 +304,11 @@ def _get_callee_and_self(callee_var: Var) -> tuple[Any, tuple[()] | tuple[Var]]:
         raise TileTypeError(f"Cannot call an object of type {callee_ty}")
 
 
-def _resolve_operand(x: hir.Operand, scope: Scope) -> Var | hir.Block | hir.Function:
+def _resolve_operand(x: hir.Operand, scope: Scope) \
+        -> Var | hir.Block | hir.Function | hir.StaticEvalExpression:
     if isinstance(x, hir.Value):
         return scope.hir2ir_varmap[x.id]
-    elif isinstance(x, hir.Block | hir.Function):
+    elif isinstance(x, hir.Block | hir.Function | hir.StaticEvalExpression):
         return x
     else:
         return loosely_typed_const(x)

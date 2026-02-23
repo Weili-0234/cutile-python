@@ -99,7 +99,7 @@ def _format_location_frame(loc: Loc) -> str:
 
     visual_col = _wcwidth(line_bytes[:loc.col].decode())
     if end_col == loc.col + 1:
-        end_visual_col = visual_col
+        end_visual_col = visual_col + 1
         cols_str = f"col {visual_col + 1}"
     else:
         end_visual_col = _wcwidth(line_bytes[:end_col].decode())
@@ -153,6 +153,21 @@ class TileUnsupportedFeatureError(TileError):
 
 class TileInternalError(TileError):
     pass
+
+
+class TileStaticEvalError(TileError):
+    """Thrown at compile time when the expression inside static_eval() violates the compile-time
+    evaluation constraints."""
+
+
+class TileStaticAssertionError(TileError):
+    """Thrown at compile time when the condition of static_assert() evaluates to False."""
+
+    def __init__(self, message: str, loc: Loc = Loc.unknown()):
+        full_message = "Static assertion failed"
+        if len(message) > 0:
+            full_message += ": " + message
+        super().__init__(full_message, loc)
 
 
 class ConstantNotFoundError(Exception):

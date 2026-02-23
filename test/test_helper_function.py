@@ -249,6 +249,20 @@ def test_early_return_inside_for_loop():
         ct.launch(torch.cuda.current_stream(), (1,), kernel, (n, out))
 
 
+def return_after_while_loop(n):
+    while n > 0:
+        n = n - 1
+    return n
+
+
+def test_return_after_while_loop():
+    n = torch.tensor([3], dtype=torch.int32, device="cuda")
+    out = torch.zeros_like(n)
+    kernel = early_return_inside_loop(return_after_while_loop)
+    ct.launch(torch.cuda.current_stream(), (1,), kernel, (n, out))
+    assert out.cpu().item() == 0
+
+
 def loops(n):
     a = 0
     for i in range(n):

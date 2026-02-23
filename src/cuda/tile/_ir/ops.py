@@ -6,21 +6,24 @@ import math
 import operator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Sequence, Tuple, Optional, Union, Any, List, Callable, Iterator, Iterable
+from typing import (
+    Literal, Sequence, Tuple, Optional, Union, Any, List, Callable, Iterator, Iterable,
+)
 
 from typing_extensions import override
 
 import cuda.tile._stub as ct
-from cuda.tile import _datatype as datatype, TileValueError
+from cuda.tile import _datatype as datatype
 from cuda.tile import RoundingMode, MemoryOrder, MemoryScope
 from cuda.tile._mutex import tile_mutex
-from cuda.tile._exception import TileTypeError, TileSyntaxError
+from cuda.tile._exception import TileTypeError, TileSyntaxError, TileError, \
+    TileStaticAssertionError, TileStaticEvalError, TileValueError
 from cuda.tile._ir.ir import (
     Operation, Var, Loc, Block,
-    terminator, add_operation, TypedOperation, Builder,
-    has_multiple_results, nested_block, PhiState, LoopVarState,
+    add_operation, Builder,
+    enter_nested_block, nested_block, PhiState, LoopVarState,
     TupleValue, make_aggregate, RangeValue, BoundMethodValue, ArrayValue, ConstantState,
-    ListValue, ClosureValue, MemoryEffect, memory_effect
+    ListValue, ClosureValue, MemoryEffect, attribute, operand, BlockRestriction
 )
 from cuda.tile._ir.load_store_impl import (
     check_load_store_hints,
@@ -64,13 +67,15 @@ from cuda.tile._datatype import (
     DType, is_integral, is_float, is_signed, is_boolean, is_restricted_float,
 )
 from cuda.tile._ir2bytecode import (
-    lower_scan, BytecodeContext, typeid,
+    BytecodeContext, typeid,
     generate_bytecode_for_block, convert_dtype, get_list_item_repr_size_in_words,
     get_list_partition_view_tile_size, tensor_view_typeid, tensor_view_typeid_for_list, dtype_typeid
 )
 import cuda.tile._bytecode as bc
 from cuda.tile._bytecode.version import BytecodeVersion
 from .._debug import CUDA_TILE_TESTING_DISABLE_DIV
+from .._dispatch_mode import StaticEvalMode
+from .._symbolic import SymbolicTile, SymbolicArray, Symbol, SymbolicClosure
 
 
 # ================================================
@@ -78,30 +83,13 @@ from .._debug import CUDA_TILE_TESTING_DISABLE_DIV
 # ================================================
 
 
-@has_multiple_results
-class Loop(TypedOperation):
-    def __init__(
-        self,
-        start: Optional[Var],
-        stop: Optional[Var],
-        step: Optional[Var],
-        initial_values: tuple[Var, ...],
-        result_vars: tuple[Var, ...],
-        body: Block,
-        loc: Loc
-    ):
-        assert (start is None) == (stop is None) == (step is None)
-        super().__init__(
-            "loop",
-            operands={"start": start, "stop": stop, "step": step, "initial_values": initial_values},
-            result_vars=list(result_vars),
-            nested_blocks=[body],
-            loc=loc,
-        )
-
-    @property
-    def body(self):
-        return self.nested_blocks[0]
+@dataclass(eq=False)
+class Loop(Operation, opcode="loop"):
+    start: Optional[Var] = operand()
+    stop: Optional[Var] = operand()
+    step: Optional[Var] = operand()
+    initial_values: tuple[Var, ...] = operand()
+    body: Block = nested_block()
 
     @property
     def is_for_loop(self) -> bool:
@@ -206,7 +194,7 @@ async def loop_impl(body: hir.Block, iterable: Var):
     # Process the loop body
     loop_info = ControlFlowInfo(stored_locals)
     body_loc = body.loc.with_call_site(scope.call_site)
-    with nested_block(body_loc) as new_body, scope.change_loop_info(loop_info), \
+    with enter_nested_block(body_loc) as new_body, scope.change_loop_info(loop_info), \
             scope.local.enter_branch():
         # Define body variables. Not all of them will eventually be kept,
         # so we don't set the block parameters yet.
@@ -271,7 +259,7 @@ async def loop_impl(body: hir.Block, iterable: Var):
                        if is_valid)
         flat_values = flatten_aggregates(values, valid_var_types)
         assert len(flat_values) == len(all_flattened_body_vars)
-        jump_info.jump_op.update_operand("values", flat_values)
+        jump_info.jump_op.values = flat_values
 
     # Create the loop Operation
     valid_initial_values = tuple(v for v, is_valid in zip(initial_values, mask, strict=True)
@@ -318,8 +306,8 @@ async def loop_impl(body: hir.Block, iterable: Var):
 
     # Do this check at the end because this may be an automatically inserted loop
     # around the helper function's body.
-    if builder.reduction_body:
-        raise TileSyntaxError("Loops inside reduction body are not supported")
+    if builder.block_restriction is not None:
+        builder.block_restriction.validate_operation(Loop)
 
 
 def _have_nested_jump(calls: Sequence[hir.Call]) -> bool:
@@ -331,31 +319,11 @@ def _have_nested_jump(calls: Sequence[hir.Call]) -> bool:
     )
 
 
-@has_multiple_results
-class IfElse(TypedOperation):
-    def __init__(
-        self,
-        cond: Var,
-        then_block: Block,
-        else_block: Block,
-        result_vars: Sequence[Var],
-        loc: Loc,
-    ):
-        super().__init__(
-            "ifelse",
-            operands={"cond": cond},
-            result_vars=list(result_vars),
-            nested_blocks=[then_block, else_block],
-            loc=loc,
-        )
-
-    @property
-    def then_block(self):
-        return self.nested_blocks[0]
-
-    @property
-    def else_block(self):
-        return self.nested_blocks[1]
+@dataclass(eq=False)
+class IfElse(Operation, opcode="ifelse"):
+    cond: Var = operand()
+    then_block: Block = nested_block()
+    else_block: Block = nested_block()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[bc.Value, ...]:
@@ -377,6 +345,26 @@ class IfElse(TypedOperation):
     @override
     def _to_string_rhs(self) -> str:
         return f"if(cond={self.cond})"
+
+
+@dataclass
+class ReduceScanRestriction(BlockRestriction):
+    """Restriction for reduction/scan body blocks: no memory effects, loops, or branching."""
+
+    kind: Literal["reduction", "scan"]
+
+    def validate_operation(self, op_class: type) -> None:
+        if getattr(op_class, "memory_effect", MemoryEffect.NONE) != MemoryEffect.NONE:
+            raise TileSyntaxError(
+                f"Operations with memory effects are not supported inside {self.kind} body"
+            )
+        if op_class is Loop:
+            raise TileSyntaxError(f"Loops inside {self.kind} body are not supported")
+        if op_class is IfElse:
+            raise TileSyntaxError(
+                f"Branching inside {self.kind} body is not supported. "
+                f"Consider ct.where() as a workaround."
+            )
 
 
 async def _flatten_branch(branch: hir.Block) -> Var | None:
@@ -403,9 +391,8 @@ async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) 
         return await _flatten_branch(branch_taken)
 
     builder = Builder.get_current()
-    if builder.reduction_body:
-        raise TileSyntaxError("Branching inside reduction body is not supported."
-                              " Consider ct.where() as a workaround.")
+    if builder.block_restriction is not None:
+        builder.block_restriction.validate_operation(IfElse)
 
     # Get the total number of results by adding the number of stored variables.
     # Note: we sort the stored variable indices to make the order deterministic.
@@ -416,7 +403,7 @@ async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) 
     # Convert the "then" branch from HIR to IR
     info = ControlFlowInfo(stored_locals)
     then_loc = then_block.loc.with_call_site(scope.call_site)
-    with nested_block(then_loc) as new_then_block, scope.change_if_else_info(info), \
+    with enter_nested_block(then_loc) as new_then_block, scope.change_if_else_info(info), \
             scope.local.enter_branch():
         await dispatch_hir_block(then_block)
 
@@ -430,7 +417,7 @@ async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) 
     else_loc = else_block.loc.with_call_site(scope.call_site)
     if len(info.jumps) == 0:
         info = ControlFlowInfo(())
-        with nested_block(else_loc) as new_else_block, scope.change_if_else_info(info), \
+        with enter_nested_block(else_loc) as new_else_block, scope.change_if_else_info(info), \
                 scope.local.enter_branch():
             end_branch(None)
         add_operation(IfElse, (),
@@ -438,7 +425,7 @@ async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) 
         return await _flatten_branch(else_block)
 
     # Convert the "else" branch from HIR to IR
-    with nested_block(else_loc) as new_else_block, scope.change_if_else_info(info), \
+    with enter_nested_block(else_loc) as new_else_block, scope.change_if_else_info(info), \
             scope.local.enter_branch():
         await dispatch_hir_block(else_block)
 
@@ -458,7 +445,7 @@ async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) 
         outputs = tuple(v for v, is_valid in zip(jump_info.outputs, mask, strict=True)
                         if is_valid)
         flat_outputs = flatten_aggregates(outputs, valid_result_types)
-        jump_info.jump_op.update_operand("outputs", flat_outputs)
+        jump_info.jump_op.outputs = flat_outputs
 
     # Generate an IfElse op
     flat_types = flatten_aggregate_types(valid_result_types)
@@ -498,14 +485,9 @@ async def if_else_impl(cond: Var, then_block: hir.Block, else_block: hir.Block) 
 
 
 # Maps to ContinueOp in TileIR
-@terminator
-class Continue(TypedOperation):
-    def __init__(
-        self,
-        loc: Loc,
-        values: Tuple[Var, ...] = (),
-    ):
-        super().__init__("continue", operands={"values": values}, result_vars=[], loc=loc)
+@dataclass(eq=False)
+class Continue(Operation, opcode="continue", terminator=True):
+    values: Tuple[Var, ...] = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
@@ -534,14 +516,9 @@ def continue_():
 
 
 # Maps to BreakOp
-@terminator
-class Break(TypedOperation):
-    def __init__(
-        self,
-        loc: Loc,
-        values: Tuple[Var, ...] = (),
-    ):
-        super().__init__("break", operands={"values": values}, result_vars=[], loc=loc)
+@dataclass(eq=False)
+class Break(Operation, opcode="break", terminator=True):
+    values: Tuple[Var, ...] = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
@@ -574,14 +551,9 @@ def break_():
 
 
 # Maps to YieldOp
-@terminator
-class EndBranch(TypedOperation):
-    def __init__(
-        self,
-        loc: Loc,
-        outputs: Tuple[Var, ...] = (),
-    ):
-        super().__init__("end_branch", operands={"outputs": outputs}, result_vars=[], loc=loc)
+@dataclass(eq=False)
+class EndBranch(Operation, opcode="end_branch", terminator=True):
+    outputs: Tuple[Var, ...] = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
@@ -609,10 +581,8 @@ def end_branch(output: Var | None):
     info.jumps.append(JumpInfo(op, outputs))
 
 
-@terminator
-class Return(TypedOperation):
-    def __init__(self, loc: Loc):
-        super().__init__("return", operands={}, result_vars=[], loc=loc)
+@dataclass(eq=False)
+class Return(Operation, opcode="return", terminator=True):
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
@@ -642,10 +612,9 @@ def _check_value_numeric_type(value: Any, dtype: DType) -> None:
             raise TileTypeError(f"Expect \"value\" to be a {dtype}, got {value_type}")
 
 
-class TypedConst(TypedOperation):
-    def __init__(self, value: Any, result_var: Var, loc: Loc):
-        super().__init__("typed_const", operands={}, result_vars=[result_var],
-                         attributes={"value": value}, loc=loc)
+@dataclass(eq=False)
+class TypedConst(Operation, opcode="typed_const"):
+    value: Any = attribute()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -673,17 +642,13 @@ def strictly_typed_const(value: Any, ty: Type) -> Var:
 
 
 # Computes lhs*rhs + acc.  Also known as FMA.
-class FusedMulAddOperation(Operation):
-    def __init__(self, lhs: Var, rhs: Var, acc: Var,
-                 rounding_mode: RoundingMode, flush_to_zero: bool,
-                 result_var: Var, loc: Loc):
-        super().__init__(
-            "fma",
-            operands={"lhs": lhs, "rhs": rhs, "acc": acc},
-            attributes={"rounding_mode": rounding_mode, "flush_to_zero": flush_to_zero},
-            result_vars=[result_var],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class FusedMulAddOperation(Operation, opcode="fma"):
+    rounding_mode: RoundingMode = attribute()
+    flush_to_zero: bool = attribute()
+    lhs: Var = operand()
+    rhs: Var = operand()
+    acc: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -700,15 +665,11 @@ class FusedMulAddOperation(Operation):
 
 
 # Does not do broadcasting or type promotion, hence the name "Raw"
-class RawComparisonOperation(TypedOperation):
-    def __init__(self, fn: str, lhs: Var, rhs: Var, result_var: Var, loc: Loc):
-        super().__init__(
-            "raw_cmp",
-            operands={"lhs": lhs, "rhs": rhs},
-            attributes={"fn": fn},
-            result_vars=[result_var],
-            loc=loc
-        )
+@dataclass(eq=False)
+class RawComparisonOperation(Operation, opcode="raw_cmp"):
+    fn: str = attribute()
+    lhs: Var = operand()
+    rhs: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext):
@@ -817,15 +778,11 @@ def _promote_and_broadcast_to(x: Var, ty: TileTy) -> Var:
 
 
 # Does not do broadcasting or type promotion, hence the name "Raw"
-class RawBinaryBitwiseOperation(TypedOperation):
-    def __init__(self, fn: str, lhs: Var, rhs: Var, result_var: Var, loc: Loc):
-        super().__init__(
-            "raw_binary_bitwise",
-            operands={"lhs": lhs, "rhs": rhs},
-            attributes={"fn": fn},
-            result_vars=[result_var],
-            loc=loc
-        )
+@dataclass(eq=False)
+class RawBinaryBitwiseOperation(Operation, opcode="raw_binary_bitwise"):
+    fn: str = attribute()
+    lhs: Var = operand()
+    rhs: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext):
@@ -888,15 +845,11 @@ def binary_bitwise(fn: str, x: Var, y: Var) -> Var:
 
 
 # Does not do broadcasting or type promotion, hence the name "Raw"
-class RawBitwiseShiftOperation(TypedOperation):
-    def __init__(self, fn: str, lhs: Var, rhs: Var, result_var: Var, loc: Loc):
-        super().__init__(
-            "raw_bitwise_shift",
-            operands={"lhs": lhs, "rhs": rhs},
-            attributes={"fn": fn},
-            result_vars=[result_var],
-            loc=loc
-        )
+@dataclass(eq=False)
+class RawBitwiseShiftOperation(Operation, opcode="raw_bitwise_shift"):
+    fn: str = attribute()
+    lhs: Var = operand()
+    rhs: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -951,17 +904,13 @@ def bitwise_shift(fn: str, x: Var, y: Var) -> Var:
 
 
 # Does not do broadcasting or type promotion, hence the name "Raw"
-class RawBinaryArithmeticOperation(TypedOperation):
-    def __init__(self, fn: str, lhs: Var, rhs: Var,
-                 rounding_mode: Optional[RoundingMode], flush_to_zero: bool,
-                 result_var: Var, loc: Loc):
-        super().__init__(
-            "raw_binary_arith",
-            operands={"lhs": lhs, "rhs": rhs},
-            attributes={"fn": fn, "rounding_mode": rounding_mode, "flush_to_zero": flush_to_zero},
-            result_vars=[result_var],
-            loc=loc
-        )
+@dataclass(eq=False)
+class RawBinaryArithmeticOperation(Operation, opcode="raw_binary_arith"):
+    fn: str = attribute()
+    rounding_mode: Optional[RoundingMode] = attribute()
+    flush_to_zero: bool = attribute()
+    lhs: Var = operand()
+    rhs: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -1074,7 +1023,6 @@ def binary_arithmetic(fn: str, x: Var, y: Var, rounding_mode: Optional[RoundingM
 @impl(ct.floordiv, fixed_args=["floordiv"])
 @impl(ct.cdiv, fixed_args=["cdiv"])
 @impl(ct.pow, fixed_args=["pow"])
-@impl(operator.add, fixed_args=["add"])
 @impl(operator.sub, fixed_args=["sub"])
 @impl(operator.mul, fixed_args=["mul"])
 @impl(operator.floordiv, fixed_args=["floordiv"])
@@ -1084,6 +1032,15 @@ def binary_arithmetic(fn: str, x: Var, y: Var, rounding_mode: Optional[RoundingM
 @impl(max, fixed_args=["max"])
 def binary_arithmetic_impl(fn: str, x: Var, y: Var) -> Var:
     return binary_arithmetic(fn, x, y)
+
+
+@impl(operator.add)
+def add_impl(x: Var, y: Var) -> Var:
+    if isinstance(x.get_type(), TupleTy) and isinstance(y.get_type(), TupleTy):
+        x_items = x.get_aggregate().items
+        y_items = y.get_aggregate().items
+        return build_tuple(x_items + y_items)
+    return binary_arithmetic("add", x, y)
 
 
 @impl(ct.minimum, fixed_args=["min"])
@@ -1227,12 +1184,10 @@ def tile_getitem(x: Var, key: Var) -> Var:
                             "use `extract()` or `item()` instead.")
 
 
-class GetArrayListItem(TypedOperation):
-    def __init__(self, x: Var, index: Var, result_vars: list[Var], loc: Loc):
-        super().__init__("get_array_list_item",
-                         operands={"x": x, "index": index},
-                         result_vars=result_vars,
-                         loc=loc)
+@dataclass(eq=False)
+class GetArrayListItem(Operation, opcode="get_array_list_item"):
+    x: Var = operand()
+    index: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext):
@@ -1341,19 +1296,28 @@ def build_tuple(items: tuple[Var, ...]) -> Var:
     return res
 
 
-class Unary(TypedOperation):
-    def __init__(self, fn: str, operand: Var,
-                 rounding_mode: Optional[RoundingMode], flush_to_zero: bool,
-                 result_var: Var, loc: Loc):
-        super().__init__("unaryop",
-                         operands={"operand": operand},
-                         attributes={
-                             "fn": fn,
-                             "rounding_mode": rounding_mode,
-                             "flush_to_zero": flush_to_zero,
-                         },
-                         result_vars=[result_var],
-                         loc=loc)
+@impl(hir.unpack)
+def unpack_impl(iterable: Var, expected_len: Var) -> Var:
+    ty = iterable.get_type()
+    # Don't use the require_tuple_type() helper because we'd like to customize the error message
+    if not isinstance(ty, TupleTy):
+        raise TileTypeError("Expected a tuple", iterable.loc)
+    expected_len = require_constant_int(expected_len)
+    if len(ty.value_types) != expected_len:
+        few_many = "few" if len(ty.value_types) < expected_len else "many"
+        raise TileValueError(f"Too {few_many} values to unpack"
+                             f" (expected {expected_len}, got {len(ty.value_types)})")
+    # Return the input tuple. If we add support for additional iterables,
+    # the idea is to cast them to a tuple here.
+    return iterable
+
+
+@dataclass(eq=False)
+class Unary(Operation, opcode="unaryop"):
+    fn: str = attribute()
+    rounding_mode: Optional[RoundingMode] = attribute()
+    flush_to_zero: bool = attribute()
+    operand: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -1392,7 +1356,7 @@ class Unary(TypedOperation):
                                                          flush_to_zero=flush_to_zero)
             case "floor", True: return bc.encode_FloorOp(ctx.builder, res_type_id, x)
             case "ceil", True: return bc.encode_CeilOp(ctx.builder, res_type_id, x)
-            case "invert", False:
+            case "invert" | "bitwise_not", False:
                 # ~tx == tx ^ ~0
                 all_ones = (-1 if datatype.is_signed(input_dtype)
                             else ~(-1 << input_dtype.bitwidth))
@@ -1456,6 +1420,7 @@ def unary(fn: str, behavior: _UnaryBehavior, x: Var,
         return strictly_typed_const(res, ty)
 
     check_rd_and_ftz(fn, rounding_mode, flush_to_zero, get_dtype(ty))
+
     return add_operation(Unary, ty, fn=fn, operand=x,
                          rounding_mode=rounding_mode, flush_to_zero=flush_to_zero)
 
@@ -1503,7 +1468,7 @@ def pos_impl(x: Var):
 @impl(ct.cos, fixed_args=["cos", _UNARY_FLOAT])
 @impl(ct.cosh, fixed_args=["cosh", _UNARY_FLOAT])
 @impl(ct.exp, fixed_args=["exp", _UNARY_FLOAT])
-@impl(ct.bitwise_not, fixed_args=["invert", _UNARY_BOOL_INT])
+@impl(ct.bitwise_not, fixed_args=["bitwise_not", _UNARY_BOOL_INT])
 @impl(ct.floor, fixed_args=["floor", _UNARY_STRICT_FLOAT])
 @impl(ct.ceil, fixed_args=["ceil", _UNARY_STRICT_FLOAT])
 @impl(ct.negative, fixed_args=["neg", _UNARY_INT_FLOAT])
@@ -1534,6 +1499,23 @@ def unary_impl_with_rd_and_ftz(fn: str, behavior: _UnaryBehavior,
 def unary_impl_with_rd(fn: str, behavior: _UnaryBehavior, x: Var, rounding_mode: Var) -> Var:
     rounding_mode = require_optional_constant_enum(rounding_mode, RoundingMode)
     return unary(fn, behavior, x, rounding_mode=rounding_mode)
+
+
+@impl(ct.isnan)
+def isnan_impl(x: Var) -> Var:
+    x_type = require_tile_maybe_loose_type(x)
+    if isinstance(x_type, LooselyTypedScalar):
+        res = math.isnan(x_type.value)
+        return loosely_typed_const(res)
+
+    ty = x.get_type()
+    if isinstance(x_type, TileTy) and (is_float(ty.dtype) or is_restricted_float(ty.dtype)):
+        if x.is_constant():
+            res = math.isnan(x.get_constant())
+            return strictly_typed_const(res, make_tile_ty(datatype.bool_, ty.shape))
+        else:
+            return raw_comparison("ne", x, x)
+    raise TileTypeError(f"Unexpected input type {x_type}")
 
 
 @impl(getattr)
@@ -1581,11 +1563,9 @@ def bind_method(object: Var, func) -> Var:
     return make_aggregate(agg_value, res_ty)
 
 
-class Assign(TypedOperation):
-    def __init__(self, value: Var, result_var: Var, loc: Loc):
-        super().__init__(
-            "assign", operands={"value": value}, result_vars=[result_var], loc=loc
-        )
+@dataclass(eq=False)
+class Assign(Operation, opcode="assign"):
+    value: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -1599,7 +1579,7 @@ class Assign(TypedOperation):
 
 
 def assign(value: Var, res: Var) -> None:
-    Builder.get_current().append_verbatim(Assign(value, res, res.loc))
+    Builder.get_current().append_verbatim(Assign(value=value, result_vars=(res,), loc=res.loc))
     res.ctx.copy_type_information(value, res)
     if value.is_undefined():
         res.set_undefined()
@@ -1680,11 +1660,9 @@ def builtin_numeric_ctor_impl(ctor_obj: Any, x: Var) -> Var:
 # Tile specific operations
 # ================================================
 
-class TileBid(TypedOperation):
-    def __init__(self, axis: int, result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_bid", operands={}, attributes={"axis": axis}, result_vars=[result_var], loc=loc
-        )
+@dataclass(eq=False)
+class TileBid(Operation, opcode="tile_bid"):
+    axis: int = attribute()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -1705,15 +1683,11 @@ def bid_impl(axis: Var) -> Var:
     return bid(axis)
 
 
-class MakeTensorView(TypedOperation):
-    def __init__(self, base_ptr: Var, shape: tuple[Var, ...], dynamic_strides: tuple[Var, ...],
-                 result_var: Var, loc: Loc):
-        super().__init__(
-            "make_tensor_view",
-            operands={"base_ptr": base_ptr, "shape": shape, "dynamic_strides": dynamic_strides},
-            result_vars=[result_var],
-            loc=loc
-        )
+@dataclass(eq=False)
+class MakeTensorView(Operation, opcode="make_tensor_view"):
+    base_ptr: Var = operand()
+    shape: tuple[Var, ...] = operand()
+    dynamic_strides: tuple[Var, ...] = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -1729,15 +1703,10 @@ class MakeTensorView(TypedOperation):
                                           dynamicStrides=dynamic_strides)
 
 
-class AssumeDivBy(TypedOperation):
-    def __init__(self, x: Var, divisor: int, result_var: Var, loc: Loc):
-        super().__init__(
-            "assume_div_by",
-            operands={"x": x},
-            attributes={"divisor": divisor},
-            result_vars=[result_var],
-            loc=loc
-        )
+@dataclass(eq=False)
+class AssumeDivBy(Operation, opcode="assume_div_by"):
+    divisor: int = attribute()
+    x: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -1752,16 +1721,11 @@ def assume_div_by(x: Var, divisor: int | None) -> Var:
     return add_operation(AssumeDivBy, x.get_type(), x=x, divisor=divisor)
 
 
-class AssumeBounded(TypedOperation):
-    def __init__(self, x: Var, lower_bound: int | None, upper_bound: int | None,
-                 result_var: Var, loc: Loc):
-        super().__init__(
-            "assume_bounded",
-            operands={"x": x},
-            attributes={"lower_bound": lower_bound, "upper_bound": upper_bound},
-            result_vars=[result_var],
-            loc=loc
-        )
+@dataclass(eq=False)
+class AssumeBounded(Operation, opcode="assume_bounded"):
+    lower_bound: int | None = attribute()
+    upper_bound: int | None = attribute()
+    x: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -1776,14 +1740,10 @@ def assume_bounded(x: Var, lower_bound: int | None, upper_bound: int | None) -> 
                          lower_bound=lower_bound, upper_bound=upper_bound)
 
 
-class MakeListView(TypedOperation):
-    def __init__(self, base_ptr: Var, length: Var, result_var: Var, loc: Loc):
-        super().__init__(
-            "make_list_view",
-            operands={"base_ptr": base_ptr, "length": length},
-            result_vars=[result_var],
-            loc=loc
-        )
+@dataclass(eq=False)
+class MakeListView(Operation, opcode="make_list_view"):
+    base_ptr: Var = operand()
+    length: Var = operand()
 
     def generate_bytecode(self, ctx: "BytecodeContext"):
         ty = self.result_var.get_type()
@@ -1914,15 +1874,9 @@ def _unflatten_proper_aggregate(flattened_iter: Iterator[Var], nominal: Type, ac
         return builder.make_aggregate(val, nominal, result_var=result_var)
 
 
-class TileNumBlocks(TypedOperation):
-    def __init__(self, axis: int, result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_num_blocks",
-            operands={},
-            attributes={"axis": axis},
-            result_vars=[result_var],
-            loc=loc
-        )
+@dataclass(eq=False)
+class TileNumBlocks(Operation, opcode="tile_num_blocks"):
+    axis: int = attribute()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -2052,21 +2006,14 @@ def array_slice_impl(array: Var, axis: Var, start: Var, stop: Var) -> Var:
     return ret
 
 
-@memory_effect(MemoryEffect.LOAD)
-class TileLoad(TypedOperation):
-    def __init__(
-        self, array: Var, index: tuple[Var, ...], order: Sequence[int],
-        padding_mode: PaddingMode, latency: Optional[int], allow_tma: Optional[bool],
-        result_var: Var, loc: Loc
-    ):
-        super().__init__(
-            "tile_load",
-            operands={"array": array, "index": index},
-            attributes={"order": tuple(order), "padding_mode": padding_mode, "latency": latency,
-                        "allow_tma": allow_tma},
-            result_vars=[result_var],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class TileLoad(Operation, opcode="tile_load", memory_effect=MemoryEffect.LOAD):
+    order: tuple[int, ...] = attribute()
+    padding_mode: PaddingMode = attribute()
+    latency: Optional[int] = attribute()
+    allow_tma: Optional[bool] = attribute()
+    array: Var = operand()
+    index: tuple[Var, ...] = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -2078,7 +2025,7 @@ def tile_load(array: Var, index: tuple[Var, ...], shape: Sequence[int], order: S
               padding_mode: PaddingMode, latency: Optional[int], allow_tma: Optional[bool]) -> Var:
     res_ty = make_tile_ty(array.get_type().dtype, shape)
     return add_operation(TileLoad, res_ty,
-                         array=array, index=index, order=order,
+                         array=array, index=index, order=tuple(order),
                          padding_mode=padding_mode, latency=latency, allow_tma=allow_tma)
 
 
@@ -2106,40 +2053,30 @@ def tile_load_impl(array: Var, index: Var, shape: Var, order: Var,
     return reshape(result, shape)
 
 
-@memory_effect(MemoryEffect.LOAD)
-class TileLoadTokenOrdered(TypedOperation):
-    def __init__(
-        self, array: Var, index: Var, order: Sequence[int],
-            padding_mode: PaddingMode, token: Var, latency: Optional[int],
-            allow_tma: Optional[bool],
-            result_var: Var, result_token: Var, loc: Loc
-    ):
-        super().__init__(
-            "tile_load_token_ordered",
-            operands={"array": array, "index": index,
-                      "token": token},
-            attributes={"order": order, "padding_mode": padding_mode,
-                        "latency": latency, "allow_tma": allow_tma},
-            result_vars=[result_var, result_token],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class TileLoadTokenOrdered(Operation, opcode="tile_load_token_ordered",
+                           memory_effect=MemoryEffect.LOAD):
+    order: tuple[int, ...] = attribute()
+    padding_mode: PaddingMode = attribute()
+    latency: Optional[int] = attribute()
+    allow_tma: Optional[bool] = attribute()
+    array: Var = operand()
+    index: Var = operand()
+    token: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[bc.Value, bc.Value]:
         return tile_load_generate_bytecode(self, ctx)
 
 
-@memory_effect(MemoryEffect.STORE)
-class TileStore(TypedOperation):
-    def __init__(self, array: Var, index: tuple[Var, ...], tile: Var, order: Sequence[int],
-                 latency: Optional[int], allow_tma: Optional[bool], loc: Loc):
-        super().__init__(
-            "tile_store",
-            operands={"array": array, "index": index, "tile": tile},
-            attributes={"order": order, "latency": latency, "allow_tma": allow_tma},
-            result_vars=[],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class TileStore(Operation, opcode="tile_store", memory_effect=MemoryEffect.STORE):
+    order: tuple[int, ...] = attribute()
+    latency: Optional[int] = attribute()
+    allow_tma: Optional[bool] = attribute()
+    array: Var = operand()
+    index: tuple[Var, ...] = operand()
+    tile: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[()]:
@@ -2154,7 +2091,7 @@ def tile_store(array: Var, index: tuple[Var, ...], tile: Var, order: Sequence[in
     tile = astype(tile, array_ty.dtype)
     if ty.ndim == 0:
         tile = reshape(tile, (1,) * array_ty.ndim)
-    add_operation(TileStore, (), array=array, index=index, tile=tile, order=order,
+    add_operation(TileStore, (), array=array, index=index, tile=tile, order=tuple(order),
                   latency=latency, allow_tma=allow_tma)
 
 
@@ -2189,41 +2126,28 @@ def tile_store_impl(array: Var, index: Var, tile: Var, order: Var,
     tile_store(array, index_items, tile, order, latency, allow_tma)
 
 
-@memory_effect(MemoryEffect.STORE)
-class TileStoreTokenOrdered(TypedOperation):
-    def __init__(self, array: Var, index: Var, tile: Var, order: Sequence[int], token: Var,
-                 latency: Optional[int], allow_tma: Optional[bool], result_token: Var, loc: Loc):
-        super().__init__(
-            "tile_store_token_ordered",
-            operands={"array": array, "index": index, "tile": tile, "token": token},
-            attributes={"order": order, "latency": latency, "allow_tma": allow_tma},
-            result_vars=[result_token],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class TileStoreTokenOrdered(Operation, opcode="tile_store_token_ordered",
+                            memory_effect=MemoryEffect.STORE):
+    order: tuple[int, ...] = attribute()
+    latency: Optional[int] = attribute()
+    allow_tma: Optional[bool] = attribute()
+    array: Var = operand()
+    index: Var = operand()
+    tile: Var = operand()
+    token: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
         return tile_store_generate_bytecode(self, ctx)
 
 
-@memory_effect(MemoryEffect.LOAD)
-class LoadPointer(TypedOperation):
-    def __init__(
-        self,
-        pointer: Var,
-        mask: Optional[Var],
-        padding_value: Optional[Var],
-        latency: Optional[int],
-        result_var: Var,
-        loc: Loc,
-    ):
-        super().__init__(
-            "load_pointer",
-            operands={"pointer": pointer, "mask": mask, "padding_value": padding_value},
-            attributes={"latency": latency},
-            result_vars=[result_var],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class LoadPointer(Operation, opcode="load_pointer", memory_effect=MemoryEffect.LOAD):
+    latency: Optional[int] = attribute()
+    pointer: Var = operand()
+    mask: Optional[Var] = operand(default=None)
+    padding_value: Optional[Var] = operand(default=None)
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -2231,27 +2155,14 @@ class LoadPointer(TypedOperation):
         return lowered_res
 
 
-@memory_effect(MemoryEffect.LOAD)
-class LoadPointerTokenOrdered(Operation):
-    def __init__(
-            self,
-            pointer: Var,
-            mask: Optional[Var],
-            padding_value: Optional[Var],
-            latency: Optional[int],
-            token: Var,
-            result_var: Var,
-            result_token: Var,
-            loc: Loc,
-    ):
-        super().__init__(
-            "load_pointer_tko",
-            operands={"pointer": pointer, "mask": mask, "padding_value": padding_value,
-                      "token": token},
-            attributes={"latency": latency},
-            result_vars=[result_var, result_token],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class LoadPointerTokenOrdered(Operation, opcode="load_pointer_tko",
+                              memory_effect=MemoryEffect.LOAD):
+    latency: Optional[int] = attribute()
+    pointer: Var = operand()
+    mask: Optional[Var] = operand()
+    padding_value: Optional[Var] = operand()
+    token: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> tuple[bc.Value, bc.Value]:
@@ -2267,23 +2178,12 @@ def load_pointer(pointer: Var, mask: Optional[Var], padding_value: Optional[Var]
                          pointer=pointer, mask=mask, padding_value=padding_value, latency=latency)
 
 
-@memory_effect(MemoryEffect.STORE)
-class StorePointer(TypedOperation):
-    def __init__(
-            self,
-            pointer: Var,
-            value: Var,
-            mask: Optional[Var],
-            latency: Optional[int],
-            loc: Loc,
-    ):
-        super().__init__(
-            "store_pointer",
-            operands={"pointer": pointer, "value": value, "mask": mask},
-            attributes={"latency": latency},
-            result_vars=[],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class StorePointer(Operation, opcode="store_pointer", memory_effect=MemoryEffect.STORE):
+    latency: Optional[int] = attribute()
+    pointer: Var = operand()
+    value: Var = operand()
+    mask: Optional[Var] = operand(default=None)
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext):
@@ -2291,25 +2191,14 @@ class StorePointer(TypedOperation):
         return ()
 
 
-@memory_effect(MemoryEffect.STORE)
-class StorePointerTokenOrdered(Operation):
-    def __init__(
-            self,
-            pointer: Var,
-            value: Var,
-            mask: Optional[Var],
-            latency: Optional[int],
-            token: Var,
-            result_token: Var,
-            loc: Loc,
-    ):
-        super().__init__(
-            "store_pointer_tko",
-            operands={"pointer": pointer, "value": value, "mask": mask, "token": token},
-            attributes={"latency": latency},
-            result_vars=[result_token],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class StorePointerTokenOrdered(Operation, opcode="store_pointer_tko",
+                               memory_effect=MemoryEffect.STORE):
+    latency: Optional[int] = attribute()
+    pointer: Var = operand()
+    value: Var = operand()
+    mask: Optional[Var] = operand()
+    token: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -2321,14 +2210,10 @@ def store_pointer(pointer: Var, value: Var, mask: Optional[Var], latency: Option
                   pointer=pointer, value=value, mask=mask, latency=latency)
 
 
-class PointerOffset(TypedOperation):
-    def __init__(self, pointer: Var, offset: Var, result_var: Var, loc: Loc):
-        super().__init__(
-            "pointer_offset",
-            operands={"pointer": pointer, "offset": offset},
-            result_vars=[result_var],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class PointerOffset(Operation, opcode="pointer_offset"):
+    pointer: Var = operand()
+    offset: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: "BytecodeContext"):
@@ -2542,37 +2427,31 @@ def _gather_scatter_pointer_and_mask(
     return pointer, final_mask
 
 
-@memory_effect(MemoryEffect.STORE)
-class TileAtomicCAS(TypedOperation):
-    def __init__(self, pointer: Var, expected: Var, desired: Var,
-                 mask: Optional[Var], memory_order: MemoryOrder, memory_scope: MemoryScope,
-                 result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_atomic_cas",
-            operands={"pointer": pointer, "expected": expected, "desired": desired, "mask": mask},
-            attributes={"memory_order": memory_order, "memory_scope": memory_scope},
-            result_vars=[result_var],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class TileAtomicCAS(Operation, opcode="tile_atomic_cas",
+                    memory_effect=MemoryEffect.STORE):
+    memory_order: MemoryOrder = attribute()
+    memory_scope: MemoryScope = attribute()
+    pointer: Var = operand()
+    expected: Var = operand()
+    desired: Var = operand()
+    mask: Optional[Var] = operand(default=None)
 
     def generate_bytecode(self, ctx: BytecodeContext):
         result_value, _ = _atomic_cas_generate_bytecode(self, ctx)
         return result_value
 
 
-@memory_effect(MemoryEffect.STORE)
-class TileAtomicCASTokenOrdered(TypedOperation):
-    def __init__(self, pointer: Var, expected: Var, desired: Var,
-                 mask: Optional[Var], memory_order: Var, memory_scope: Var, token: Var,
-                 result_var: Var, result_token: Var, loc: Loc):
-        super().__init__(
-            "tile_atomic_cas_token_ordered",
-            operands={"pointer": pointer, "expected": expected, "desired": desired,
-                      "mask": mask, "token": token},
-            attributes={"memory_order": memory_order, "memory_scope": memory_scope},
-            result_vars=[result_var, result_token],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class TileAtomicCASTokenOrdered(Operation, opcode="tile_atomic_cas_token_ordered",
+                                memory_effect=MemoryEffect.STORE):
+    memory_order: MemoryOrder = attribute()
+    memory_scope: MemoryScope = attribute()
+    pointer: Var = operand()
+    expected: Var = operand()
+    desired: Var = operand()
+    mask: Optional[Var] = operand()
+    token: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext):
@@ -2633,18 +2512,14 @@ class AtomicRMWMode(enum.Enum):
     EXCHANGE = bc.AtomicRMWMode.XCHG
 
 
-@memory_effect(MemoryEffect.STORE)
-class TileAtomicRMW(TypedOperation):
-    def __init__(self, mode: AtomicRMWMode, pointer: Var, update: Var,
-                 mask: Optional[Var], memory_order: MemoryOrder, memory_scope: MemoryScope,
-                 result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_atomic_rmw",
-            attributes={"mode": mode, "memory_order": memory_order, "memory_scope": memory_scope},
-            operands={"pointer": pointer, "update": update, "mask": mask, },
-            result_vars=[result_var],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class TileAtomicRMW(Operation, opcode="tile_atomic_rmw", memory_effect=MemoryEffect.STORE):
+    mode: AtomicRMWMode = attribute()
+    memory_order: MemoryOrder = attribute()
+    memory_scope: MemoryScope = attribute()
+    pointer: Var = operand()
+    update: Var = operand()
+    mask: Optional[Var] = operand(default=None)
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext):
@@ -2652,18 +2527,16 @@ class TileAtomicRMW(TypedOperation):
         return result_value
 
 
-@memory_effect(MemoryEffect.STORE)
-class TileAtomicRMWTokenOrdered(TypedOperation):
-    def __init__(self, mode: AtomicRMWMode, pointer: Var, update: Var,
-                 mask: Optional[Var], memory_order: MemoryOrder, memory_scope: MemoryScope,
-                 token: Var, result_var: Var, result_token: Var, loc: Loc):
-        super().__init__(
-            "tile_atomic_rmw_token_ordered",
-            attributes={"mode": mode, "memory_order": memory_order, "memory_scope": memory_scope},
-            operands={"pointer": pointer, "update": update, "mask": mask, "token": token},
-            result_vars=[result_var, result_token],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class TileAtomicRMWTokenOrdered(Operation, opcode="tile_atomic_rmw_token_ordered",
+                                memory_effect=MemoryEffect.STORE):
+    mode: AtomicRMWMode = attribute()
+    memory_order: MemoryOrder = attribute()
+    memory_scope: MemoryScope = attribute()
+    pointer: Var = operand()
+    update: Var = operand()
+    mask: Optional[Var] = operand()
+    token: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext):
@@ -2752,13 +2625,8 @@ def atomic_rmw_impl(int_mode: Optional[AtomicRMWMode],
                          mask=mask, memory_order=memory_order, memory_scope=memory_scope)
 
 
-class MakeToken(Operation):
-    def __init__(self, result_var: Var, loc: Loc):
-        super().__init__(
-            "make_token",
-            operands={},
-            result_vars=[result_var],
-            loc=loc)
+@dataclass(eq=False)
+class MakeToken(Operation, opcode="make_token"):
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -2766,17 +2634,13 @@ class MakeToken(Operation):
 
 
 def make_token(*, block: Block, res: Var, loc: Loc) -> None:
-    make_token_op = MakeToken(res, loc)
+    make_token_op = MakeToken(result_vars=(res,), loc=loc)
     block.append(make_token_op)
 
 
-class JoinTokens(Operation):
-    def __init__(self, tokens: Tuple[Var, ...], result_var: Var, loc: Loc):
-        super().__init__(
-            "join_tokens",
-            operands={"tokens": tokens},
-            result_vars=[result_var],
-            loc=loc)
+@dataclass(eq=False)
+class JoinTokens(Operation, opcode="join_tokens"):
+    tokens: Tuple[Var, ...] = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -2785,22 +2649,16 @@ class JoinTokens(Operation):
 
 
 def join_tokens(tokens: Tuple[Var, ...], *, block: Block, res: Var, loc: Loc) -> None:
-    join_tokens_op = JoinTokens(tokens, res, loc)
+    join_tokens_op = JoinTokens(tokens=tokens, result_vars=(res,), loc=loc)
     block.append(join_tokens_op)
 
 
-class NumTiles(TypedOperation):
-    def __init__(
-        self, array: Var, axis: int, shape: Sequence[int], order: Sequence[int],
-            result_var: Var, loc: Loc
-    ):
-        super().__init__(
-            "num_tiles",
-            operands={"array": array},
-            attributes={"axis": axis, "shape": tuple(shape), "order": tuple(order)},
-            result_vars=[result_var],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class NumTiles(Operation, opcode="num_tiles"):
+    axis: int = attribute()
+    shape: tuple[int, ...] = attribute()
+    order: tuple[int, ...] = attribute()
+    array: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext):
@@ -2813,7 +2671,7 @@ class NumTiles(TypedOperation):
 
 def num_tiles(array: Var, axis: int, shape: Sequence[int], order: Sequence[int]) -> Var:
     return add_operation(NumTiles, make_tile_ty(datatype.default_int_type, ()), array=array,
-                         axis=axis, shape=shape, order=order)
+                         axis=axis, shape=tuple(shape), order=tuple(order))
 
 
 @impl(ct.num_tiles)
@@ -2900,11 +2758,11 @@ def _matmul_broadcast_shape(x_shape: TupleTy, y_shape: TupleTy) -> \
     return (x_shape, y_shape, acc_shape, output_shape)
 
 
-class TileMma(TypedOperation):
-    def __init__(self, x: Var, y: Var, acc: Var, result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_mma", operands={"x": x, "y": y, "acc": acc}, result_vars=[result_var], loc=loc
-        )
+@dataclass(eq=False)
+class TileMma(Operation, opcode="tile_mma"):
+    x: Var = operand()
+    y: Var = operand()
+    acc: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -2973,21 +2831,12 @@ def matmul(x: Var, y: Var) -> Var:
     return ret
 
 
-class TileReduce(TypedOperation):
-    def __init__(self, xs: tuple[Var, ...], identities: tuple[bool | int | float, ...], axis: int,
-                 body: Block, result_vars: tuple[Var, ...], loc: Loc):
-        super().__init__(
-            "tile_reduce",
-            operands={"xs": xs},
-            attributes={"identities": identities, "axis": axis},
-            nested_blocks=[body],
-            result_vars=result_vars,
-            loc=loc,
-        )
-
-    @property
-    def body(self):
-        return self.nested_blocks[0]
+@dataclass(eq=False)
+class TileReduce(Operation, opcode="tile_reduce"):
+    identities: tuple[bool | int | float, ...] = attribute()
+    axis: int = attribute()
+    xs: tuple[Var, ...] = operand()
+    body: Block = nested_block()
 
     @property
     def lhs(self):
@@ -3045,11 +2894,17 @@ class TileReduce(TypedOperation):
         return nested_builder.done()
 
 
-async def raw_reduce(xs: tuple[Var, ...], identities: tuple[bool | int | float], axis: int,
-                     body: Callable) -> tuple[Var, ...]:
+async def _get_reduce_scan_body_block(
+    xs: tuple[Var, ...],
+    body: Callable,
+    *,
+    op_name: Literal["reduction", "scan"],
+) -> tuple[Block, tuple[TileTy, ...]]:
+    """Build body block for reduce/scan. Caller passes result_shape; returns
+    (body_block, result_types)."""
     builder = Builder.get_current()
-    if builder.reduction_body:
-        raise TileSyntaxError("Nested reduction is not supported")
+    if isinstance(builder.block_restriction, ReduceScanRestriction):
+        raise TileSyntaxError("Nested scan/reduction is not supported")
 
     block_params = []
     lhs_vars = []
@@ -3070,13 +2925,9 @@ async def raw_reduce(xs: tuple[Var, ...], identities: tuple[bool | int | float],
         lhs_vars.append(block_params[-2])
         rhs_vars.append(block_params[-1])
 
-    assert 0 <= axis < len(input_shape)
-    result_shape = input_shape[:axis] + input_shape[axis+1:]
-    result_types = tuple(make_tile_ty(x.get_type().dtype, result_shape) for x in xs)
-
-    assert len(xs) == len(identities)
-
-    with nested_block(builder.loc, reduction_body=True) as body_block:
+    with enter_nested_block(
+            builder.loc,
+            block_restriction=ReduceScanRestriction(op_name)) as body_block:
         body_block.params = tuple(block_params)
         body_results = await body(tuple(lhs_vars), tuple(rhs_vars))
         for body_res, x in zip(body_results, xs, strict=True):
@@ -3085,6 +2936,21 @@ async def raw_reduce(xs: tuple[Var, ...], identities: tuple[bool | int | float],
             assert body_res_ty.dtype == x.get_type().dtype
 
         add_operation(EndBranch, (), outputs=body_results)
+
+    return body_block
+
+
+async def raw_reduce(xs: tuple[Var, ...], identities: tuple[bool | int | float], axis: int,
+                     body: Callable) -> tuple[Var, ...]:
+    input_shape = require_tile_type(xs[0]).shape_value
+
+    assert 0 <= axis < len(input_shape)
+    result_shape = input_shape[:axis] + input_shape[axis + 1:]
+    result_types = tuple(make_tile_ty(x.get_type().dtype, result_shape) for x in xs)
+
+    assert len(xs) == len(identities)
+
+    body_block = await _get_reduce_scan_body_block(xs, body, op_name="reduction")
 
     return add_operation(TileReduce, result_types, xs=xs, identities=identities, axis=axis,
                          body=body_block)
@@ -3129,6 +2995,51 @@ async def reduce(xs: tuple[Var, ...], identities: tuple[bool | int | float, ...]
     return tuple(reshape(x, result_shape) for x in xs)
 
 
+def _make_reduce_scan_body(
+    func: Var,
+    tuple_mode: bool,
+    xs: tuple[Var, ...],
+    op_name: Literal["Reduction", "Scan"],
+) -> Callable:
+    """Build the shared body(lhs, rhs) used by reduce_impl and scan_impl."""
+
+    async def body(lhs, rhs):
+        from .._passes.hir2ir import call
+        res = await call(func, (*lhs, *rhs), {})
+        assert isinstance(res, Var)
+        res_ty = res.get_type()
+        if tuple_mode:
+            if not isinstance(res_ty, TupleTy):
+                raise TileTypeError(f"{op_name} function returns a value of type"
+                                    f" {res_ty}, but a tuple was expected", res.loc)
+            if len(res_ty.value_types) != len(xs):
+                raise TileTypeError(f"{op_name} function must return a tuple of {len(xs)} values"
+                                    f" to match the number of inputs, but a tuple of length"
+                                    f" {len(res_ty.value_types)} was found.")
+            res_tupval = res.get_aggregate()
+            assert isinstance(res_tupval, TupleValue)
+            results = res_tupval.items
+        else:
+            results = (res,)
+
+        cast_results = []
+        for i, (xi, r) in enumerate(zip(xs, results, strict=True)):
+            r_ty = r.get_type()
+            extra_ctx = f" at position #{i}" if tuple_mode else ""
+            if not isinstance(r_ty, TileTy):
+                raise TileTypeError(f"{op_name} function returned"
+                                    f" a value of non-tile type {r_ty}{extra_ctx}")
+            if r_ty.ndim > 0:
+                raise TileTypeError(f"{op_name} function returned"
+                                    f" a tile of non-scalar shape {r_ty.shape_value}{extra_ctx}")
+            error_ctx = f"{op_name} function returned a tile of unexpected dtype{extra_ctx}"
+            cast_results.append(_implicit_cast(r, xi.get_type().dtype, error_ctx))
+
+        return tuple(cast_results)
+
+    return body
+
+
 @impl(ct.reduce)
 async def reduce_impl(x: Var, axis: Var, func: Var, identity: Var, keepdims: Var) -> Var:
     x_ty = require_tile_or_tile_tuple_type(x)
@@ -3158,40 +3069,7 @@ async def reduce_impl(x: Var, axis: Var, func: Var, identity: Var, keepdims: Var
     # Parse keepdims
     keepdims = require_constant_bool(keepdims)
 
-    async def body(lhs, rhs):
-        from .._passes.hir2ir import call
-        res = await call(func, (*lhs, *rhs), {})
-        assert isinstance(res, Var)
-        res_ty = res.get_type()
-        if tuple_mode:
-            if not isinstance(res_ty, TupleTy):
-                raise TileTypeError(f"Reduction function returns a value of type"
-                                    f" {res_ty}, but a tuple was expected", res.loc)
-            if len(res_ty.value_types) != len(xs):
-                raise TileTypeError(f"Reduction function must return a tuple of {len(xs)} values"
-                                    f" to match the number of inputs, but a tuple of length"
-                                    f" {len(res_ty.value_types)} was found.")
-            res_tupval = res.get_aggregate()
-            assert isinstance(res_tupval, TupleValue)
-            results = res_tupval.items
-        else:
-            results = (res,)
-
-        cast_results = []
-        for i, (xi, r) in enumerate(zip(xs, results, strict=True)):
-            r_ty = r.get_type()
-            extra_ctx = f" at position #{i}" if tuple_mode else ""
-            if not isinstance(r_ty, TileTy):
-                raise TileTypeError(f"Reduction function returned"
-                                    f" a value of non-tile type {r_ty}{extra_ctx}")
-            if r_ty.ndim > 0:
-                raise TileTypeError(f"Reduction function returned"
-                                    f" a tile of non-scalar shape {r_ty.shape_value}{extra_ctx}")
-            error_ctx = f"Reduction function returned a tile of unexpected dtype{extra_ctx}"
-            cast_results.append(_implicit_cast(r, xi.get_type().dtype, error_ctx))
-
-        return tuple(cast_results)
-
+    body = _make_reduce_scan_body(func, tuple_mode, xs, "Reduction")
     reduced_tiles = await reduce(xs, id_values, axis, keepdims, body)
     if tuple_mode:
         return build_tuple(reduced_tiles)
@@ -3343,54 +3221,177 @@ async def argmax_argmin_impl(fn: str, x: Var, axis: Var, keepdims: Var) -> Var:
     return await argmax_argmin(fn, x, axis, keepdims)
 
 
-class TileScan(TypedOperation):
-    def __init__(self, fn: str, x: Var, axis: int, reverse: bool,
-                 rounding_mode: Optional[RoundingMode], flush_to_zero: bool,
-                 result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_scan",
-            operands={"x": x},
-            attributes={
-                "fn": fn, "axis": axis, "reverse": reverse,
-                "rounding_mode": rounding_mode, "flush_to_zero": flush_to_zero,
-            },
-            result_vars=[result_var],
-            loc=loc,
-        )
+@dataclass(eq=False)
+class TileScan(Operation, opcode="tile_scan"):
+    axis: int = attribute()
+    reverse: bool = attribute()
+    identities: tuple[bool | int | float, ...] = attribute()
+    xs: tuple[Var, ...] = operand()
+    body: Block = nested_block()
+
+    @property
+    def lhs(self):
+        params = self.body.params
+        assert len(params) == len(self.xs) * 2
+        return params[:len(self.xs)]
+
+    @property
+    def rhs(self):
+        params = self.body.params
+        assert len(params) == len(self.xs) * 2
+        return params[len(self.xs):]
 
     @override
-    def generate_bytecode(self, ctx: BytecodeContext):
-        x_type = ctx.typeof(self.x)
-        x_value = ctx.get_value(self.x)
-        res_type = ctx.typeof(self.result_var)
-        return lower_scan(ctx, x_value, x_type, self.axis, self.reverse,
-                          res_type, self.fn, self.rounding_mode, self.flush_to_zero)
+    def _to_string_block_prefixes(self) -> List[str]:
+        return ["do"]
+
+    @override
+    def generate_bytecode(self, ctx: BytecodeContext) -> tuple[bc.Value, ...]:
+        xs = tuple(ctx.get_value(x) for x in self.xs)
+        res_typeids = tuple(ctx.typeid_of(v) for v in self.result_vars)
+
+        identities = []
+        param_type_ids = []
+        for id_val, x in zip(self.identities, self.xs, strict=True):
+            x_dtype = get_dtype(x.get_type())
+            x_dtype_id = dtype_typeid(ctx.type_table, x_dtype)
+            if datatype.is_float(x_dtype):
+                x_dtype_bc = x_dtype._bytecode_type
+                attr = bc.Float(float(id_val), x_dtype_bc, ctx.type_table)
+            elif datatype.is_boolean(x_dtype):
+                attr = bc.Bool(bool(id_val))
+            else:
+                assert datatype.is_integral(x_dtype)
+                attr = bc.Integer(x_dtype_id, x_dtype.bitwidth, int(id_val))
+            identities.append(attr)
+
+            x_tile_typeid = ctx.type_table.tile(x_dtype_id, ())
+            param_type_ids.append(x_tile_typeid)
+            param_type_ids.append(x_tile_typeid)
+
+        nested_builder = bc.encode_ScanOp(
+            ctx.builder,
+            result_types=res_typeids,
+            operands=xs,
+            dim=self.axis,
+            reverse=self.reverse,
+            identities=identities,
+        )
+
+        with nested_builder.new_block(param_type_ids) as block_args:
+            for var, value in zip(self.body.params, block_args, strict=True):
+                ctx.set_value(var, value)
+            generate_bytecode_for_block(ctx, self.body)
+
+        return nested_builder.done()
 
 
-def scan(fn: str, x: Var, axis: int, reverse: bool, rounding_mode: Optional[RoundingMode] = None,
-         flush_to_zero: bool = False) -> Var:
+async def raw_scan(xs: tuple[Var, ...], identities: tuple[bool | int | float, ...], axis: int,
+                   reverse: bool, body: Callable) -> tuple[Var, ...]:
+    input_shape = require_tile_type(xs[0]).shape_value
+    assert 0 <= axis < len(input_shape)
+    result_types = tuple(make_tile_ty(x.get_type().dtype, input_shape) for x in xs)
+    assert len(xs) == len(identities)
+    body_block = await _get_reduce_scan_body_block(xs, body, op_name="scan")
+    return add_operation(TileScan, result_types, xs=xs, identities=identities, axis=axis,
+                         reverse=reverse, body=body_block)
+
+
+async def scan_simple(fn: str, x: Var, axis: int, reverse: bool,
+                      rounding_mode: Optional[RoundingMode] = None,
+                      flush_to_zero: bool = False) -> Var:
     x_type = require_tile_type(x)
     check_rd_and_ftz(fn, rounding_mode, flush_to_zero, x_type.dtype)
-    x_shape = x_type.shape
+
+    if datatype.is_boolean(x_type.dtype):
+        x = astype(x, datatype.default_int_type)
+        x_type = require_tile_type(x)
+
+    match fn:
+        case "add":
+            id_val = 0
+        case "mul":
+            id_val = 1
+        case _:
+            assert False
+
+    x_shape = x_type.shape_value
     axis = normalize_axis(axis, len(x_shape))
-    x_dtype = datatype.default_int_type if datatype.is_boolean(x_type.dtype) else x_type.dtype
-    x = _promote_and_broadcast_to(x, TileTy(x_dtype, x_shape))
-    return add_operation(
-        TileScan, TileTy(x_dtype, x_shape),
-        fn=fn, x=x, axis=axis, reverse=reverse,
-        rounding_mode=rounding_mode, flush_to_zero=flush_to_zero
-    )
+    x_dtype = x_type.dtype
+    x = _promote_and_broadcast_to(x, make_tile_ty(x_dtype, x_shape))
+
+    async def body(lhs: tuple[Var], rhs: tuple[Var]) -> tuple[Var]:
+        [lhs], [rhs] = lhs, rhs
+        ret = raw_binary_arithmetic(fn, lhs, rhs,
+                                    rounding_mode=rounding_mode, flush_to_zero=flush_to_zero)
+        return (ret,)
+
+    [ret] = await raw_scan((x,), (id_val,), axis, reverse, body)
+    return ret
+
+
+@impl(ct.scan)
+async def scan_impl(x: Var, axis: Var, func: Var, identity: Var, reverse: Var) -> Var:
+    x_ty = require_tile_or_tile_tuple_type(x)
+
+    tuple_mode = isinstance(x_ty, TupleTy)
+    if tuple_mode:
+        tup_val = x.get_aggregate()
+        assert isinstance(tup_val, TupleValue)
+        xs = tup_val.items
+    else:
+        xs = (x,)
+
+    axis = require_constant_int(axis)
+    require_callable_type(func)
+    reverse = require_constant_bool(reverse)
+
+    body = _make_reduce_scan_body(func, tuple_mode, xs, "Scan")
+
+    if len(xs) == 0:
+        raise TileTypeError("Need at least one input value to scan")
+
+    common_input_shape = ()
+
+    x_types = tuple(require_tile_type(x) for x in xs)
+    for x_ty in x_types:
+        try:
+            common_input_shape = broadcast_shapes2(common_input_shape, x_ty.shape_value)
+        except BroadcastError:
+            all_shapes = ", ".join(str(ty.shape_value) for ty in x_types)
+            raise TileTypeError(f"Input shapes {all_shapes}"
+                                f" are not broadcastable to a common shape")
+    xs = tuple(broadcast_to(x, common_input_shape) for x in xs)
+
+    # Normalize axis (e.g. -1 -> last axis) before raw_scan
+    axis = normalize_axis(axis, len(common_input_shape))
+
+    if tuple_mode:
+        id_values = require_constant_scalar_tuple(identity)
+        if len(id_values) != len(xs):
+            raise TileTypeError(f"Number of identity values ({len(id_values)}) must match"
+                                f" the number of input tiles ({len(xs)})")
+    else:
+        id_values = (require_constant_scalar(identity),)
+
+    scaned_tiles = await raw_scan(xs, id_values, axis, reverse, body)
+    if tuple_mode:
+        return build_tuple(scaned_tiles)
+    else:
+        [ret] = scaned_tiles
+        return ret
 
 
 @impl(ct.cumsum, fixed_args=["add"])
 @impl(ct.cumprod, fixed_args=["mul"])
-def scan_impl_with_rd_and_ftz(fn: str, x: Var, axis: Var, reverse: Var,
-                              rounding_mode: Var, flush_to_zero: Var) -> Var:
+async def scan_impl_with_rd_and_ftz(fn: str, x: Var, axis: Var, reverse: Var,
+                                    rounding_mode: Var, flush_to_zero: Var) -> Var:
     axis = require_constant_int(axis)
     reverse = require_constant_bool(reverse)
     rounding_mode = require_optional_constant_enum(rounding_mode, RoundingMode)
     flush_to_zero = require_constant_bool(flush_to_zero)
-    return scan(fn, x, axis, reverse, rounding_mode=rounding_mode, flush_to_zero=flush_to_zero)
+    return await scan_simple(fn, x, axis, reverse,
+                             rounding_mode=rounding_mode, flush_to_zero=flush_to_zero)
 
 
 def expand_dims(x: Var, axis: int) -> Var:
@@ -3408,15 +3409,11 @@ def expand_dims_impl(x: Var, axis: Var) -> Var:
     return expand_dims(x, axis)
 
 
-class TileCat(TypedOperation):
-    def __init__(self, x: Var, y: Var, axis: int, result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_cat",
-            operands={"x": x, "y": y},
-            attributes={"axis": axis},
-            result_vars=[result_var],
-            loc=loc
-        )
+@dataclass(eq=False)
+class TileCat(Operation, opcode="tile_cat"):
+    axis: int = attribute()
+    x: Var = operand()
+    y: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -3481,11 +3478,11 @@ def cat_impl(tiles: Var, axis: Var) -> Var:
 
 
 # Does not support broadcasting or type promotion
-class RawWhereOperation(TypedOperation):
-    def __init__(self, cond, x, y, result_var: Var, loc: Loc):
-        super().__init__(
-            "raw_where", operands={"cond": cond, "x": x, "y": y}, result_vars=[result_var], loc=loc
-        )
+@dataclass(eq=False)
+class RawWhereOperation(Operation, opcode="raw_where"):
+    cond: Var = operand()
+    x: Var = operand()
+    y: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -3520,14 +3517,10 @@ def where(cond, x, y) -> Var:
     return raw_where(cond, x, y)
 
 
-@memory_effect(MemoryEffect.STORE)
-class TilePrintf(TypedOperation):
-    def __init__(self, format: str, args: Tuple[Var, ...], loc: Loc):
-        super().__init__("tile_printf",
-                         operands={"args": args},
-                         attributes={"format": format},
-                         result_vars=[],
-                         loc=loc)
+@dataclass(eq=False)
+class TilePrintf(Operation, opcode="tile_printf", memory_effect=MemoryEffect.STORE):
+    format: str = attribute()
+    args: Tuple[Var, ...] = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext):
@@ -3547,13 +3540,10 @@ def printf_impl(format: Var, args: Tuple[Var, ...]) -> None:
     add_operation(TilePrintf, (), format=parsed_format, args=args)
 
 
-@memory_effect(MemoryEffect.STORE)
-class TileAssert(TypedOperation):
-    def __init__(self, cond: Var, message: str, loc: Loc):
-        super().__init__("assert",
-                         operands={"cond": cond},
-                         attributes={"message": message},
-                         result_vars=[], loc=loc)
+@dataclass(eq=False)
+class TileAssert(Operation, opcode="assert", memory_effect=MemoryEffect.STORE):
+    message: str = attribute()
+    cond: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext):
@@ -3571,9 +3561,9 @@ def assert_impl(cond: Var, message: Var) -> None:
     add_operation(TileAssert, (), cond=cond, message=msg_str)
 
 
-class TileBroadcast(TypedOperation):
-    def __init__(self, x: Var, result_var: Var, loc: Loc):
-        super().__init__("tile_broadcast", operands={"x": x}, result_vars=[result_var], loc=loc)
+@dataclass(eq=False)
+class TileBroadcast(Operation, opcode="tile_broadcast"):
+    x: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -3608,11 +3598,9 @@ def broadcast_to_impl(x: Var, shape: Var) -> Var:
     return broadcast_to(x, shape)
 
 
-class TileAsType(TypedOperation):
-    def __init__(self, x: Var, result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_astype", operands={"x": x}, result_vars=[result_var], loc=loc
-        )
+@dataclass(eq=False)
+class TileAsType(Operation, opcode="tile_astype"):
+    x: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -3639,20 +3627,9 @@ def astype_impl(x: Var, dtype: Var) -> Var:
     return astype(x, dtype)
 
 
-def tile_astype(x: Var, dtype: Var,
-                block: Block, loc: Loc, res: Var) -> None:
-    tile_astype_op = TileAsType(x, dtype, res, loc)
-    block.append(tile_astype_op)
-
-
-class TileBitCast(TypedOperation):
-    def __init__(self, x: Var, result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_bitcast",
-            operands={"x": x},
-            attributes={},
-            result_vars=[result_var], loc=loc
-        )
+@dataclass(eq=False)
+class TileBitCast(Operation, opcode="tile_bitcast"):
+    x: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -3676,16 +3653,8 @@ def bitcast_impl(x: Var, dtype: Var) -> Var:
     return bitcast(x, dtype_val)
 
 
-class TileArange(TypedOperation):
-    def __init__(self, result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_arange",
-            operands={},
-            attributes={},
-            result_vars=[result_var],
-            loc=loc
-        )
-
+@dataclass(eq=False)
+class TileArange(Operation, opcode="tile_arange"):
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
         res_type = ctx.typeid_of(self.result_var)
@@ -3710,11 +3679,9 @@ def arange_impl(size: Var, dtype: Var) -> Var:
     return arange(size_val, dtype_val)
 
 
-class TileReshape(TypedOperation):
-    def __init__(self, x: Var, result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_reshape", operands={"x": x}, result_vars=[result_var], loc=loc
-        )
+@dataclass(eq=False)
+class TileReshape(Operation, opcode="tile_reshape"):
+    x: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -3763,14 +3730,10 @@ def reshape_impl(x: Var, shape: Var) -> Var:
     return reshape(x, new_shape)
 
 
-class TilePermute(TypedOperation):
-    def __init__(self, x: Var, axes: Sequence[int], result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_permute",
-            operands={"x": x},
-            attributes={"axes": axes},
-            result_vars=[result_var],
-            loc=loc)
+@dataclass(eq=False)
+class TilePermute(Operation, opcode="tile_permute"):
+    axes: tuple[int, ...] = attribute()
+    x: Var = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -3830,15 +3793,11 @@ def transpose_impl(x: Var, axis0: Var, axis1: Var) -> Var:
     return transpose(x, a0, a1)
 
 
-class TileExtract(TypedOperation):
-    def __init__(self, x: Var, index: tuple[Var, ...], shape: Sequence[int],
-                 result_var: Var, loc: Loc):
-        super().__init__(
-            "tile_extract",
-            operands={"x": x, "index": index},
-            attributes={"shape": tuple(shape)},
-            result_vars=[result_var], loc=loc
-        )
+@dataclass(eq=False)
+class TileExtract(Operation, opcode="tile_extract"):
+    shape: tuple[int, ...] = attribute()
+    x: Var = operand()
+    index: tuple[Var, ...] = operand()
 
     @override
     def generate_bytecode(self, ctx: BytecodeContext) -> bc.Value:
@@ -3851,7 +3810,7 @@ class TileExtract(TypedOperation):
 def extract(x: Var, index: tuple[Var, ...], shape: Sequence[int]) -> Var:
     dtype = get_dtype(x.get_type())
     res_ty = make_tile_ty(dtype, shape)
-    return add_operation(TileExtract, res_ty, x=x, index=index, shape=shape)
+    return add_operation(TileExtract, res_ty, x=x, index=index, shape=tuple(shape))
 
 
 @impl(ct.extract)
@@ -3950,3 +3909,158 @@ def make_closure_impl(func_hir: hir.Function, default_values: tuple[Var, ...]):
                            tuple(frozen_capture_types_by_depth))
     closure_val = ClosureValue(default_values, tuple(frozen_captures_by_depth))
     return make_aggregate(closure_val, closure_ty)
+
+
+@impl(ct.static_eval)
+def static_eval_impl(expr: Var):
+    raise TileSyntaxError("static_eval() must be used directly by name,"
+                          " e.g. cuda.tile.static_eval() or ct.static_eval().")
+
+
+@impl(ct.static_assert)
+def static_assert_impl(condition: Var, message: Var):
+    raise TileSyntaxError("static_assert() must be used directly by name,"
+                          " e.g. cuda.tile.static_assert() or ct.static_assert().")
+
+
+@impl(ct.static_iter)
+def static_iter_impl(iterable: Var):
+    raise TileSyntaxError("static_iter() must be used directly by name,"
+                          " e.g. cuda.tile.static_iter() or ct.static_iter().")
+
+
+@impl(hir.do_static_eval)
+def do_static_eval_impl(expr: hir.StaticEvalExpression,
+                        local_var_values: tuple[Var, ...]) -> Var:
+    local_proxies = tuple(var2sym(x) for x in local_var_values)
+    with StaticEvalMode(expr.kind).as_current():
+        try:
+            result = expr.compiled_expr(*local_proxies)
+        except TileError:
+            raise
+        except Exception as e:
+            where = expr.kind._value_
+            msg = f"Exception was raised inside {where} ({type(e).__name__}"
+            e_str = str(e)
+            if len(e_str) > 0:
+                msg += ": " + e_str
+            msg += ")"
+            raise TileStaticEvalError(msg) from e
+
+    if expr.kind == hir.StaticEvalKind.STATIC_ASSERT_MESSAGE:
+        if result is None:
+            result = ""
+        return loosely_typed_const(str(result))
+    elif expr.kind == hir.StaticEvalKind.STATIC_ITER_ITERABLE:
+        items = _drain_static_iter_iterable(result)
+        return build_tuple(tuple(items))
+    else:
+        return sym2var(result)
+
+
+_STATIC_ITER_MAX_ITERATIONS = 1000
+
+
+def _drain_static_iter_iterable(iterable) -> list[Var]:
+    try:
+        it = iter(iterable)
+    except Exception as e:
+        msg = str(e)
+        if len(msg) > 0:
+            msg = ": " + msg
+        raise TileTypeError(f"Invalid static_iter() iterable{msg}")
+
+    items = []
+    for i in range(_STATIC_ITER_MAX_ITERATIONS + 1):
+        try:
+            x = next(it)
+        except StopIteration:
+            break
+        except Exception as e:
+            msg = str(e)
+            if len(msg) > 0:
+                msg = ": " + msg
+            raise TileTypeError(f"Error was raised while obtaining item #{i}"
+                                f" from the static_iter() iterable{msg}")
+
+        try:
+            var = sym2var(x)
+        except TileTypeError as e:
+            raise TileStaticEvalError(
+                f"Invalid item #{i} of static_iter() iterable: {str(e)}")
+
+        items.append(var)
+    else:
+        raise TileStaticEvalError(f"Maximum number of iterations"
+                                  f" ({_STATIC_ITER_MAX_ITERATIONS}) has been reached"
+                                  f" while unpacking the static_iter() iterable")
+    return items
+
+
+@impl(hir.do_static_assert)
+async def do_static_assert_impl(condition: Var, message_block: hir.Block) -> None:
+    if not condition.is_constant():
+        raise TileTypeError("static_assert() condition must be a compile-time constant")
+
+    ty = condition.get_type()
+    if not (isinstance(ty, TileTy) and is_boolean(ty.dtype)):
+        raise TileTypeError(f"static_assert() condition must be a boolean, not {ty}")
+
+    if condition.get_constant():
+        return None
+
+    from .._passes.hir2ir import dispatch_hir_block
+    info = ControlFlowInfo((), flatten=True)
+    with Scope.get_current().change_if_else_info(info):
+        await dispatch_hir_block(message_block)
+    [jump] = info.jumps
+    assert jump.jump_op is None
+    [message] = jump.outputs
+    message = message.get_constant()
+    assert isinstance(message, str)
+    raise TileStaticAssertionError(message)
+
+
+@impl(hir.static_foreach)
+async def static_foreach_impl(body: hir.Block, items: Var):
+    scope = Scope.get_current()
+
+    tuple_val = items.get_aggregate()
+    assert isinstance(tuple_val, TupleValue)
+
+    for item in tuple_val.items:
+        scope.hir2ir_varmap[body.params[0].id] = item
+        from .._passes.hir2ir import dispatch_hir_block
+        await dispatch_hir_block(body)
+
+
+def var2sym(var: Var) -> Any:
+    if var.is_constant():
+        return var.get_constant()
+
+    ty = var.get_type()
+    if isinstance(ty, TileTy | DType):
+        return SymbolicTile(var)
+    elif isinstance(ty, ArrayTy):
+        return SymbolicArray(var)
+    elif isinstance(ty, TupleTy):
+        tup_val = var.get_aggregate()
+        assert isinstance(tup_val, TupleValue)
+        return tuple(var2sym(x) for x in tup_val.items)
+    elif isinstance(ty, ClosureTy):
+        return SymbolicClosure(var)
+    else:
+        raise NotImplementedError(f"Objects of type {ty} are not supported at compile time")
+
+
+def sym2var(x: Any) -> Var:
+    # TODO: verify we don't have a stale closure
+
+    if isinstance(x, Symbol):
+        return x._var
+
+    if isinstance(x, tuple):
+        return build_tuple(tuple(sym2var(item) for item in x))
+
+    x = get_constant_value(x)
+    return loosely_typed_const(x)

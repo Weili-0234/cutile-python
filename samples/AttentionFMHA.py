@@ -99,7 +99,7 @@ def fmha_kernel(Q, K, V, Out,
         # --- Apply Causal Masking ---
         if (CAUSAL or not EVEN_K) and j >= mask_start:
             offs_n = j * TILE_N + offs_n_tile
-            mask = ct.full((TILE_M, TILE_N), True, dtype=np.bool)
+            mask = ct.full((TILE_M, TILE_N), True, dtype=np.bool_)
             # out of bound mask
             if not EVEN_K:
                 mask = mask & (offs_n < k_seqlen)

@@ -78,6 +78,7 @@ Scan
 
    cumsum
    cumprod
+   scan
 
 
 Matmul
@@ -118,6 +119,7 @@ Math
    maximum
    negative
    abs
+   isnan
 
    exp
    exp2
@@ -187,3 +189,14 @@ Utility
 
    printf
    assert_
+
+
+Metaprogramming Support
+-----------------------
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   static_assert
+   static_eval
+   static_iter

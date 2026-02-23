@@ -19,7 +19,8 @@ import inspect
 import threading
 from dataclasses import dataclass
 from textwrap import indent
-from typing import Any, Set, OrderedDict
+from types import CodeType
+from typing import Any, Set, OrderedDict, Callable
 
 from cuda.tile._exception import Loc, FunctionDesc
 
@@ -192,6 +193,10 @@ class Function:
     # Empty when this is a top-level function.
     enclosing_funcs: "tuple[Function, ...]"
 
+    # Code object compiled for evaluation inside static_eval context.
+    # Only set for nested functions & lambdas.
+    code_object: CodeType | None
+
     def __repr__(self):
         return f"<HIR for function {self.desc}>"
 
@@ -218,10 +223,28 @@ class _OperandFormatter:
 # Special function stubs used in HIR
 # ==================================
 
+
+class StaticEvalKind(enum.Enum):
+    STATIC_EVAL = "static_eval()"
+    STATIC_ASSERT_CONDITION = "static_assert() condition"
+    STATIC_ASSERT_MESSAGE = "static_assert() message"
+    STATIC_ITER_ITERABLE = "static_iter() iterable"
+
+
+@dataclass
+class StaticEvalExpression:
+    compiled_expr: Callable
+    kind: StaticEvalKind
+
+
 def if_else(cond, then_block, else_block, /): ...
 def loop(body, iterable, /): ...  # infinite if `iterable` is None
+def static_foreach(body, items, /): ...
 def build_tuple(*items): ...  # Makes a tuple (i.e. returns `items`)
+def unpack(iterable, expected_len, /): ...
 def identity(x): ...   # Identity function (i.e. returns `x`)
 def store_var(name, value, /): ...  # Store into a named variable
 def load_var(name, /): ...  # Load from a named variable
 def make_closure(func_hir: Function, /, *default_values): ...
+def do_static_eval(expr: StaticEvalExpression, *local_var_values): ...
+def do_static_assert(condition, message_block, /): ...
