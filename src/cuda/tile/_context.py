@@ -5,6 +5,7 @@
 import atexit
 import os
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass
 from typing import Optional
@@ -16,6 +17,8 @@ class TileContextConfig:
     log_keys: list[str]
     compiler_timeout_sec: Optional[int]
     enable_crash_dump: bool
+    cache_dir: Optional[str]
+    cache_size_limit: int
 
 
 def init_context_config_from_env():
@@ -23,7 +26,9 @@ def init_context_config_from_env():
             temp_dir=get_temp_dir_from_env(),
             log_keys=get_log_keys_from_env(),
             compiler_timeout_sec=get_compile_timeout_from_env(),
-            enable_crash_dump=get_enable_crash_dump_from_env()
+            enable_crash_dump=get_enable_crash_dump_from_env(),
+            cache_dir=get_cache_dir_from_env(),
+            cache_size_limit=get_cache_size_limit_from_env()
             )
     return config
 
@@ -71,3 +76,20 @@ def get_enable_crash_dump_from_env() -> bool:
     key = "CUDA_TILE_ENABLE_CRASH_DUMP"
     env = os.environ.get(key, "0").lower()
     return env in ("1", "true", "yes", "on")
+
+
+def get_cache_dir_from_env() -> Optional[str]:
+    home_cache = os.path.join(os.path.expanduser("~"), ".cache")
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA", home_cache)
+    else:
+        base = os.environ.get("XDG_CACHE_HOME", home_cache)
+    default = os.path.join(base, "cutile-python")
+    env = os.environ.get("CUDA_TILE_CACHE_DIR", default)
+    if env.strip().lower() in ("0", "off", "none", ""):
+        return None
+    return env
+
+
+def get_cache_size_limit_from_env() -> int:
+    return int(os.environ.get("CUDA_TILE_CACHE_SIZE", 1 << 31))  # 2GB
